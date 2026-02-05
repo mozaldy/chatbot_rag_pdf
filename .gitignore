@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual Environment
+venv/
+.venv/
+env/
+
+# Environment Variables
+.env
+
+# IDEs
+.vscode/
+.idea/
+
+# System
+.DS_Store
+Thumbs.db
+
+# Logs and Databases
+*.log
+*.sqlite
+
+# Qdrant / Data Storage (if created locally)
+qdrant_storage/
+storage/
+
+# Temporary files
+tmp/
+temp/
