@@ -88,31 +88,34 @@ def get_sparse_embedding_functions():
         tokenizer = model.tokenizer
         
         for weight_dict in lexical_weights_list:
-            # weight_dict is likely Dict[str, float] based on typical FlagEmbedding usage.
-            # Convert str keys to token IDs.
-            # Note: This is slightly inefficient (str -> int), but BGE-M3 implementation often works this way.
-            # Let's optimize: model.compute_lexical_weights??
-            # Actually, `encode` in FlagEmbedding calls `compute_lexical_weights`.
-            # Let's inspect what we have. If keys are strings:
-            
-            # Helper to safely get ID.
-            row_indices = []
-            row_values = []
+            # Use dict to ensure uniqueness of indices and merge duplicate weights
+            id_to_weight = {}
             
             for token, weight in weight_dict.items():
-                # If token is implicitly an ID (unlikely), use it.
-                # Otherwise convert.
                 if isinstance(token, int):
-                    row_indices.append(token)
+                    _id = token
                 else:
-                    # Convert token string to ID. 
-                    # Warning: token might be part of a word.
-                    ids = tokenizer.convert_tokens_to_ids(token)
-                    # If unknown, skip?
-                    if ids != tokenizer.unk_token_id:
-                        row_indices.append(ids)
-                    
-                row_values.append(float(weight))
+                    # BGE-M3 FlagModel returns tokens (str). Convert to ID.
+                    _id = tokenizer.convert_tokens_to_ids(token)
+                
+                # Handle int, list, or invalid returns
+                if isinstance(_id, int):
+                    # Merge weights if ID already exists (sum or max)
+                    if _id in id_to_weight:
+                        id_to_weight[_id] += float(weight)
+                    else:
+                        id_to_weight[_id] = float(weight)
+                elif isinstance(_id, list) and len(_id) == 1:
+                    _id = _id[0]
+                    if _id in id_to_weight:
+                        id_to_weight[_id] += float(weight)
+                    else:
+                        id_to_weight[_id] = float(weight)
+            
+            # Convert dict to sorted lists (Qdrant doesn't require sorting but good practice)
+            sorted_items = sorted(id_to_weight.items())
+            row_indices = [idx for idx, _ in sorted_items]
+            row_values = [val for _, val in sorted_items]
             
             indices.append(row_indices)
             values.append(row_values)
