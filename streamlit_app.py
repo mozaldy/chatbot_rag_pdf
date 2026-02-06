@@ -29,6 +29,20 @@ with st.sidebar:
                 except Exception as e:
                     st.error(f"❌ Connection Error: {e}")
 
+    st.markdown("---")
+    st.header("Database Management")
+    if st.button("⚠️ Reset Database", type="primary", help="Deletes all vectors and resets the collection"):
+        with st.spinner("Resetting database..."):
+            try:
+                response = requests.delete(f"{API_URL}/reset")
+                if response.status_code == 200:
+                    st.success("✅ Database Reset Successfully!")
+                    st.balloons()
+                else:
+                    st.error(f"❌ Error: {response.text}")
+            except Exception as e:
+                st.error(f"❌ Connection Error: {e}")
+
 # Main Chat Interface
 st.subheader("Chat with your Data")
 

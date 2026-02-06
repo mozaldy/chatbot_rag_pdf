@@ -12,6 +12,13 @@ class Settings(BaseSettings):
     # Models
     EMBEDDING_MODEL: str = "BAAI/bge-m3"
     
+    # Chunking Configuration
+    CHUNK_SIZE: int = 512  # Tokens per chunk (larger = more context)
+    CHUNK_OVERLAP: int = 128  # Overlap between chunks for continuity
+    
+    # PDF Processing
+    ENABLE_OCR: bool = True  # Set to True if you have scanned docs or mixed content
+    
     # LLM Configuration (Main/Inference)
     LLM_PROVIDER: str = "ollama"
     LLM_MODEL: str = "gemma3:4b"

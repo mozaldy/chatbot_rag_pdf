@@ -6,10 +6,12 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 
 from fastapi import UploadFile
-from docling.document_converter import DocumentConverter
+from docling.document_converter import DocumentConverter, PdfFormatOption
+from docling.datamodel.base_models import InputFormat
+from docling.datamodel.pipeline_options import PdfPipelineOptions, EasyOcrOptions
 
 from llama_index.core import Document, VectorStoreIndex, StorageContext
-from llama_index.core.node_parser import MarkdownNodeParser
+from llama_index.core.node_parser import SentenceSplitter
 from llama_index.vector_stores.qdrant import QdrantVectorStore
 from qdrant_client import QdrantClient
 
@@ -40,54 +42,77 @@ class IngestionService:
     async def process_pdf(self, file: UploadFile):
         temp_path = self._save_upload_file(file)
         try:
-            # 1. Parsing with Docling
+            # 1. Parsing with Docling (OCR disabled for text-based PDFs)
             logger.info(f"Parsing PDF with Docling: {file.filename}")
-            converter = DocumentConverter()
+            
+            # Configure pipeline to skip OCR for text-based PDFs
+            pipeline_options = PdfPipelineOptions()
+            pipeline_options.do_ocr = settings.ENABLE_OCR
+            
+            converter = DocumentConverter(
+                format_options={
+                    InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)
+                }
+            )
             result = converter.convert(temp_path)
             # Export to markdown to preserve table structures
             md_content = result.document.export_to_markdown()
+            
+            logger.info(f"Extracted {len(md_content)} characters from PDF")
 
             # 2. Generate Global Summary
             logger.info("Generating Global Summary...")
-            # We take a sensible prefix of the document to avoid context window overflow on the generation step if strict.
-            # Gemma 3 4b context window checks? Assuming it handles a reasonable amount.
-            # Truncate for safety to ~10k chars for summary generation prompt if needed, 
-            # or rely on Ollama/LlamaIndex truncating. Let's send the first 8000 words roughly or just full logic.
-            # For robustness, let's take the first 15000 characters for the summary context.
+            # Take first 15000 characters for summary context
             context_for_summary = md_content[:15000] 
             summary_prompt = (
                 "You are a helpful AI assistant. Read the following document excerpt and provide a "
                 "comprehensive 'Global Summary' of the main topics, purpose, and key findings. "
+                "List ALL major features and capabilities mentioned. "
                 "Keep it concise but informative (around 200 words).\n\n"
                 f"Document Content:\n{context_for_summary}"
             )
             
             global_summary = await self._generate_summary_with_retry(summary_prompt)
-            logger.info(f"Global Summary generated: {global_summary[:50]}...")
+            logger.info(f"Global Summary generated: {global_summary[:100]}...")
 
             # 3. Chunking & Enrichment
             logger.info("Chunking and enriching...")
-            # Use MarkdownNodeParser since we have structure
-            parser = MarkdownNodeParser()
-            documents = [Document(text=md_content, metadata={"filename": file.filename})]
+            
+            # Use SentenceSplitter for better semantic chunking
+            parser = SentenceSplitter(
+                chunk_size=settings.CHUNK_SIZE,
+                chunk_overlap=settings.CHUNK_OVERLAP,
+                paragraph_separator="\n\n",
+                secondary_chunking_regex="[^,.;。？！]+[,.;。？！]?"
+            )
+            
+            # CRITICAL FIX: Do NOT include global_summary in the Document metadata passed to the splitter.
+            # The splitter validates that (text + metadata) < chunk_size.
+            # Since global_summary is huge (~1000 chars), it causes a ValueError.
+            # We will inject it manually into the nodes AFTER splitting.
+            documents = [Document(
+                text=md_content, 
+                metadata={
+                    "filename": file.filename,
+                    # "global_summary": global_summary  <-- REMOVED from here to fix ValueError
+                }
+            )]
             nodes = parser.get_nodes_from_documents(documents)
 
-            # Prepend Global Summary to each node's text or metadata for retrieval context
+            # Store metadata without prepending to text
+            # This keeps embeddings focused on actual content
             valid_nodes = []
-            for node in nodes:
-                # We prepend to the text to ensure the embedding captures this context effectively
-                # "Parent Document Context: {summary} \n\n Section Content: {node_text}"
-                original_text = node.get_content()
-                enriched_text = (
-                    f"Global Document Context: {global_summary}\n\n---\n\n{original_text}"
-                )
-                node.set_content(enriched_text)
-                
-                # Keep original metadata and add summary
-                node.metadata["global_summary"] = global_summary
+            for idx, node in enumerate(nodes):
+                # Keep original text - don't dilute with summary
+                # Metadata is accessible during retrieval
                 node.metadata["filename"] = file.filename
                 
-                # Exclude embedding logic from here, LlamaIndex handles it in ingestion
+                # INJECT SUMMARY HERE
+                node.metadata["global_summary"] = global_summary
+                
+                node.metadata["chunk_index"] = idx
+                node.metadata["total_chunks"] = len(nodes)
+                
                 valid_nodes.append(node)
 
             # 4. Storage (Dense + Sparse/Hybrid)
