@@ -1,13 +1,12 @@
 z# Local RAG APP (FastAPI + LlamaIndex + Qdrant)
 
-A memory-efficient RAG application built for Fedora Linux and limited VRAM (RTX 3050 6GB). It uses `Docling` for PDF parsing, `Ollama` (gemma3:4b) for global summarization and inference, and `Qdrant` for hybrid search (Dense + Sparse).
+A memory-efficient RAG application built for Fedora Linux and limited VRAM (RTX 3050 6GB). It uses `Docling` for PDF parsing, `Gemini` (gemini-2.5-flash) for global summarization and inference, and `Qdrant` for hybrid search (Dense + Sparse).
 
 ## Prerequisites
 
 1.  **Docker & Docker Compose**: For running the Qdrant vector database.
-2.  **Ollama**: Installed and running locally.
-    *   Pull the model: `ollama pull gemma3:4b`
-    *   Serve it: `ollama serve`
+2.  **Google API Key**: Required for Gemini.
+    *   Set it in `.env` as `GOOGLE_API_KEY=AIza...`
 3.  **Python 3.10+** (Tested on 3.13.11)
 
 ## Installation

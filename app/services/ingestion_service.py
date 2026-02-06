@@ -6,9 +6,10 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 
 from fastapi import UploadFile
-from docling.document_converter import DocumentConverter, PdfFormatOption
-from docling.datamodel.base_models import InputFormat
 from docling.datamodel.pipeline_options import PdfPipelineOptions, EasyOcrOptions
+from docling.datamodel.base_models import InputFormat
+from docling.document_converter import DocumentConverter, PdfFormatOption
+from docling.datamodel.pipeline_options import PdfPipelineOptions, EasyOcrOptions, PictureDescriptionApiOptions
 
 from llama_index.core import Document, VectorStoreIndex, StorageContext
 from llama_index.core.node_parser import SentenceSplitter
@@ -48,6 +49,20 @@ class IngestionService:
             # Configure pipeline to skip OCR for text-based PDFs
             pipeline_options = PdfPipelineOptions()
             pipeline_options.do_ocr = settings.ENABLE_OCR
+            pipeline_options.images_scale = 2.0 # Higher resolution for VLM (default 1.0/72dpi is too low)
+            
+            # --- VLM Configuration (Gemini) ---
+            if settings.DOCLING_ENABLE_VLM and settings.GOOGLE_API_KEY:
+                logger.info(f"Enabling VLM (Picture Description) using {settings.DOCLING_VLM_MODEL}")
+                pipeline_options.generate_picture_images = True
+                
+                pipeline_options.picture_description_options = PictureDescriptionApiOptions(
+                    url=settings.DOCLING_VLM_ENDPOINT,
+                    api_key=settings.GOOGLE_API_KEY,
+                    model=settings.DOCLING_VLM_MODEL,
+                    # Optional: Add system prompt or other params if needed, but generic works for openai-compatible
+                )
+            # ----------------------------------
             
             converter = DocumentConverter(
                 format_options={
