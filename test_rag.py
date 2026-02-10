@@ -5,9 +5,8 @@ Run after re-ingesting your PDF
 """
 
 import requests
-import json
 
-API_BASE = "http://localhost:8000"
+API_BASE = "http://localhost:8000/api"
 
 def test_query(question: str):
     """Test a query and display results"""
@@ -27,7 +26,10 @@ def test_query(question: str):
         print(f"\n{'-'*80}")
         print("SOURCES:")
         for source in data["sources"]:
-            print(f"  • {source}")
+            print(
+                f"  • {source['id']} | {source['filename']} | "
+                f"chunk={source['chunk_index']} | score={source['score']}"
+            )
     else:
         print(f"ERROR: {response.status_code}")
         print(response.text)

@@ -1,6 +1,5 @@
 import streamlit as st
 import requests
-import json
 
 # Configuration
 API_URL = "http://localhost:8000/api"
@@ -54,6 +53,16 @@ if "messages" not in st.session_state:
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
+        # Display sources if they exist in the message
+        if "sources" in message:
+            st.markdown("---")
+            st.markdown("**📚 Sources:**")
+            for source in message["sources"]:
+                with st.expander(
+                    f"{source['id']} • {source['filename']} "
+                    f"(chunk {source['chunk_index']}, score: {source['score']})"
+                ):
+                    st.markdown(source['text'])
 
 # React to user input
 if prompt := st.chat_input("What would you like to know?"):
@@ -65,7 +74,7 @@ if prompt := st.chat_input("What would you like to know?"):
     # Display assistant response in chat message container
     with st.chat_message("assistant"):
         message_placeholder = st.empty()
-        full_response = ""
+        sources_placeholder = st.empty()
         
         try:
             with st.spinner("Thinking..."):
@@ -77,17 +86,33 @@ if prompt := st.chat_input("What would you like to know?"):
                     answer = data.get("response", "No response")
                     sources = data.get("sources", [])
                     
-                    full_response = answer
-                    if sources:
-                        full_response += "\n\n**Sources:**\n" + "\n".join([f"- {s}" for s in set(sources)])
+                    # Display the answer
+                    message_placeholder.markdown(answer)
                     
-                    message_placeholder.markdown(full_response)
+                    # Display interactive sources
+                    if sources:
+                        with sources_placeholder.container():
+                            st.markdown("---")
+                            st.markdown("**📚 Sources:**")
+                            for source in sources:
+                                with st.expander(
+                                    f"{source['id']} • {source['filename']} "
+                                    f"(chunk {source['chunk_index']}, score: {source['score']})",
+                                    expanded=False
+                                ):
+                                    st.markdown(source['text'])
+                    
+                    # Store in session with sources for history
+                    st.session_state.messages.append({
+                        "role": "assistant", 
+                        "content": answer,
+                        "sources": sources
+                    })
                 else:
-                    full_response = f"Error: {response.text}"
-                    message_placeholder.error(full_response)
+                    error_msg = f"Error: {response.text}"
+                    message_placeholder.error(error_msg)
+                    st.session_state.messages.append({"role": "assistant", "content": error_msg})
         except Exception as e:
-            full_response = f"Connection Error: {e}"
-            message_placeholder.error(full_response)
-            
-    # Add assistant response to chat history
-    st.session_state.messages.append({"role": "assistant", "content": full_response})
+            error_msg = f"Connection Error: {e}"
+            message_placeholder.error(error_msg)
+            st.session_state.messages.append({"role": "assistant", "content": error_msg})

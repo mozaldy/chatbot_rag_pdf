@@ -1,4 +1,4 @@
-z# Local RAG APP (FastAPI + LlamaIndex + Qdrant)
+# Local RAG APP (FastAPI + LlamaIndex + Qdrant)
 
 A memory-efficient RAG application built for Fedora Linux and limited VRAM (RTX 3050 6GB). It uses `Docling` for PDF parsing, `Ollama` (gemma3:4b) for global summarization and inference, and `Qdrant` for hybrid search (Dense + Sparse).
 
@@ -50,6 +50,15 @@ streamlit run streamlit_app.py
 ```
 This will open the web UI at `http://localhost:8501`.
 
+### 4. Run Quality Evaluation
+```bash
+python3 evaluate_rag.py
+```
+Optional custom case file and output report:
+```bash
+python3 evaluate_rag.py --cases ./my_eval_cases.json --out ./rag_eval_report.json
+```
+
 ## API Usage
 
 ### 1. Ingest a PDF
@@ -77,8 +86,8 @@ curl -X POST "http://localhost:8000/api/chat" \
 ## System Architecture
 
 *   **Ingestion Pipeline**: 
-    PDF -> Docling (Markdown) -> Ollama (Global Summary) -> Chunking -> Enrichment (Prepending Summary) -> BAAI/bge-m3 (Dense+Sparse Embedding) -> Qdrant.
+    PDF -> Docling (Markdown) -> Markdown normalization (dehyphenation/boilerplate cleanup) -> deterministic `doc_id/chunk_id` generation -> duplicate skip / same-filename replacement -> chunking -> BAAI/bge-m3 (Dense+Sparse Embedding) -> Qdrant.
 *   **Retrieval Pipeline**: 
-    User Query -> Hybrid Search (Top 5) -> Context Construction -> Ollama (Gemma 3) -> Answer.
+    User Query -> Hybrid Retrieval (dense+sparse) -> lexical-aware reranking -> source-labeled context (`[S1]`, `[S2]`) -> grounded answer generation with inline citations.
 *   **Memory Management**: 
     Strict Singleton pattern usage for `HuggingFaceEmbedding` and `Ollama` clients to prevent VRAM overflow.

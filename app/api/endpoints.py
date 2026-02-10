@@ -1,16 +1,22 @@
-from fastapi import APIRouter, UploadFile, File, HTTPException
-from typing import List
+from fastapi import APIRouter, UploadFile, File, HTTPException, Query
 
-from llama_index.core import VectorStoreIndex
-from llama_index.vector_stores.qdrant import QdrantVectorStore
-from qdrant_client import AsyncQdrantClient
+from qdrant_client import QdrantClient
 
 from app.services.ingestion_service import IngestionService
+from app.services.document_lifecycle_service import DocumentLifecycleService
+from app.services.retrieval_service import RetrievalService
 from app.core.config import settings
-from app.core.llm_setup import get_llm, get_embedding_model, get_sparse_embedding_functions
-from app.models.schemas import ChatRequest, ChatResponse, IngestionResponse
+from app.models.schemas import (
+    ChatRequest,
+    ChatResponse,
+    DocumentDeleteResponse,
+    DocumentListResponse,
+    DocumentSummary,
+    IngestionResponse,
+)
 
 router = APIRouter()
+
 
 @router.post("/ingest", response_model=IngestionResponse)
 async def ingest_document(file: UploadFile = File(...)):
@@ -22,8 +28,16 @@ async def ingest_document(file: UploadFile = File(...)):
 async def reset_database():
     """Wipes the vector database collection to start fresh."""
     try:
-        from qdrant_client import QdrantClient
-        client = QdrantClient(host=settings.QDRANT_HOST, port=settings.QDRANT_PORT)
+        client = QdrantClient(
+            host=settings.QDRANT_HOST,
+            port=settings.QDRANT_PORT,
+            timeout=settings.QDRANT_TIMEOUT,
+        )
+        if not client.collection_exists(collection_name=settings.COLLECTION_NAME):
+            return {
+                "status": "success",
+                "message": f"Collection '{settings.COLLECTION_NAME}' is already absent.",
+            }
         client.delete_collection(collection_name=settings.COLLECTION_NAME)
         return {"status": "success", "message": f"Collection '{settings.COLLECTION_NAME}' deleted."}
     except Exception as e:
@@ -31,71 +45,63 @@ async def reset_database():
 
 @router.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
-    # Enhanced retrieval logic with better parameters
     try:
-        # 1. Setup Retriever
-        client = AsyncQdrantClient(host=settings.QDRANT_HOST, port=settings.QDRANT_PORT)
-        
-        # Singleton models
-        embed_model = get_embedding_model()
-        sparse_doc_fn, sparse_query_fn = get_sparse_embedding_functions()
-        
-        vector_store = QdrantVectorStore(
-            aclient=client,
-            collection_name=settings.COLLECTION_NAME,
-            enable_hybrid=True,
-            sparse_doc_fn=sparse_doc_fn,
-            sparse_query_fn=sparse_query_fn
-        )
-        
-        index = VectorStoreIndex.from_vector_store(
-            vector_store=vector_store,
-            embed_model=embed_model
-        )
-        
-        # 2. Query Engine with improved retrieval
-        llm = get_llm()
-        
-        # Retrieve MORE candidates for better coverage
-        # Hybrid search combines dense + sparse for better recall
-        retriever = index.as_retriever(
-            vector_store_query_mode="hybrid", 
-            similarity_top_k=10,  # Increased from 5
-            sparse_top_k=10,  # Increased from 5
-        )
-        
-        # Add similarity threshold filtering
-        from llama_index.core.postprocessor import SimilarityPostprocessor
-        from llama_index.core.query_engine import RetrieverQueryEngine
-        from llama_index.core.response_synthesizers import ResponseMode
-        
-        # Filter out low-relevance results
-        node_postprocessors = [
-            SimilarityPostprocessor(similarity_cutoff=0.5)
-        ]
-        
-        query_engine = RetrieverQueryEngine.from_args(
-            retriever=retriever,
-            llm=llm,
-            node_postprocessors=node_postprocessors,
-            response_mode=ResponseMode.COMPACT,  # Better synthesis
-        )
-        
-        response = await query_engine.aquery(request.messages)
-        
-        # Enhanced source tracking
-        sources = []
-        for node in response.source_nodes:
-            source_info = {
-                "filename": node.node.metadata.get("filename", "unknown"),
-                "chunk_index": node.node.metadata.get("chunk_index", "?"),
-                "score": round(node.score, 3) if hasattr(node, 'score') else None
-            }
-            sources.append(f"{source_info['filename']} (chunk {source_info['chunk_index']}, score: {source_info['score']})")
-        
-        return {
-            "response": str(response),
-            "sources": sources
-        }
+        service = RetrievalService()
+        return await service.answer_query(request.messages)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/documents", response_model=DocumentListResponse)
+async def list_documents(
+    max_points: int | None = Query(default=None, ge=1, le=100000),
+):
+    try:
+        service = DocumentLifecycleService()
+        return service.list_documents(max_points=max_points)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.delete("/documents/by-filename", response_model=DocumentDeleteResponse)
+async def delete_document_by_filename(
+    filename: str = Query(..., min_length=1),
+):
+    try:
+        service = DocumentLifecycleService()
+        result = service.delete_by_filename(filename=filename)
+        if result["status"] == "not_found":
+            raise HTTPException(status_code=404, detail=result["message"])
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/documents/{doc_id}", response_model=DocumentSummary)
+async def get_document(doc_id: str):
+    try:
+        service = DocumentLifecycleService()
+        doc = service.get_document(doc_id=doc_id)
+        if doc is None:
+            raise HTTPException(status_code=404, detail=f"Document '{doc_id}' not found.")
+        return doc
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.delete("/documents/{doc_id}", response_model=DocumentDeleteResponse)
+async def delete_document(doc_id: str):
+    try:
+        service = DocumentLifecycleService()
+        result = service.delete_by_doc_id(doc_id=doc_id)
+        if result["status"] == "not_found":
+            raise HTTPException(status_code=404, detail=result["message"])
+        return result
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

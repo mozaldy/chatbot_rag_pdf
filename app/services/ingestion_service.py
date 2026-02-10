@@ -1,22 +1,28 @@
 import os
 import shutil
 import logging
-from typing import List
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 
 from fastapi import UploadFile
 from docling.document_converter import DocumentConverter, PdfFormatOption
 from docling.datamodel.base_models import InputFormat
-from docling.datamodel.pipeline_options import PdfPipelineOptions, EasyOcrOptions
+from docling.datamodel.pipeline_options import PdfPipelineOptions
 
 from llama_index.core import Document, VectorStoreIndex, StorageContext
 from llama_index.core.node_parser import SentenceSplitter
 from llama_index.vector_stores.qdrant import QdrantVectorStore
 from qdrant_client import QdrantClient
+from qdrant_client.models import FieldCondition, Filter, MatchValue
 
 from app.core.config import settings
-from app.core.llm_setup import get_llm, get_fast_llm, get_embedding_model, get_sparse_embedding_functions
+from app.core.llm_setup import get_fast_llm, get_embedding_model, get_sparse_embedding_functions
+from app.services.rag_quality import (
+    compute_chunk_id,
+    compute_document_id,
+    compute_point_uuid,
+    normalize_markdown_text,
+)
 
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 # Import common API errors if possible to be specific, or generic Exception for now
@@ -29,12 +35,11 @@ logger = logging.getLogger(__name__)
 
 class IngestionService:
     def __init__(self):
-        # We use the sync QdrantClient for LlamaIndex indexing flow usually,
-        # or we can use the async one if properly configured.
-        # LlamaIndex's QdrantVectorStore defaults to sync client under the hood for some ops.
-        # Let's use the standard client for the vector store.
-        self.qdrant_client = QdrantClient(host=settings.QDRANT_HOST, port=settings.QDRANT_PORT)
-        # Use Fast LLM for ingestion/enrichment tasks
+        self.qdrant_client = QdrantClient(
+            host=settings.QDRANT_HOST,
+            port=settings.QDRANT_PORT,
+            timeout=settings.QDRANT_TIMEOUT,
+        )
         self.llm = get_fast_llm()
         self.embed_model = get_embedding_model()
         self.sparse_doc_fn, self.sparse_query_fn = get_sparse_embedding_functions()
@@ -42,95 +47,93 @@ class IngestionService:
     async def process_pdf(self, file: UploadFile):
         temp_path = self._save_upload_file(file)
         try:
-            # 1. Parsing with Docling (OCR disabled for text-based PDFs)
             logger.info(f"Parsing PDF with Docling: {file.filename}")
-            
-            # Configure pipeline to skip OCR for text-based PDFs
             pipeline_options = PdfPipelineOptions()
             pipeline_options.do_ocr = settings.ENABLE_OCR
-            
             converter = DocumentConverter(
                 format_options={
                     InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)
                 }
             )
             result = converter.convert(temp_path)
-            # Export to markdown to preserve table structures
-            md_content = result.document.export_to_markdown()
-            
-            logger.info(f"Extracted {len(md_content)} characters from PDF")
+            raw_markdown = result.document.export_to_markdown()
+            normalized_markdown = normalize_markdown_text(raw_markdown)
 
-            # 2. Generate Global Summary
-            logger.info("Generating Global Summary...")
-            # Take first 15000 characters for summary context
-            context_for_summary = md_content[:15000] 
-            summary_prompt = (
-                "You are a helpful AI assistant. Read the following document excerpt and provide a "
-                "comprehensive 'Global Summary' of the main topics, purpose, and key findings. "
-                "List ALL major features and capabilities mentioned. "
-                "Keep it concise but informative (around 200 words).\n\n"
-                f"Document Content:\n{context_for_summary}"
+            if not normalized_markdown:
+                raise ValueError("No readable content extracted from PDF.")
+
+            doc_id = compute_document_id(file.filename, normalized_markdown)
+            existing_chunks = self._count_chunks_for_doc(doc_id)
+            if existing_chunks > 0:
+                logger.info(
+                    "Skipping duplicate ingestion for %s (doc_id=%s, chunks=%s)",
+                    file.filename,
+                    doc_id,
+                    existing_chunks,
+                )
+                return {
+                    "filename": file.filename,
+                    "status": "duplicate_skipped",
+                    "chunks": existing_chunks,
+                    "global_summary": "Duplicate content already indexed.",
+                    "doc_id": doc_id,
+                    "replaced_points": 0,
+                }
+
+            replaced_points = self._delete_points_for_filename(file.filename)
+            logger.info(
+                "Prepared ingestion for %s (doc_id=%s, replaced_points=%s)",
+                file.filename,
+                doc_id,
+                replaced_points,
             )
-            
-            global_summary = await self._generate_summary_with_retry(summary_prompt)
-            logger.info(f"Global Summary generated: {global_summary[:100]}...")
 
-            # 3. Chunking & Enrichment
-            logger.info("Chunking and enriching...")
-            
-            # Use SentenceSplitter for better semantic chunking
+            logger.info("Generating global summary for %s", file.filename)
+            global_summary = await self._generate_summary(normalized_markdown)
+
             parser = SentenceSplitter(
                 chunk_size=settings.CHUNK_SIZE,
                 chunk_overlap=settings.CHUNK_OVERLAP,
                 paragraph_separator="\n\n",
                 secondary_chunking_regex="[^,.;。？！]+[,.;。？！]?"
             )
-            
-            # CRITICAL FIX: Do NOT include global_summary in the Document metadata passed to the splitter.
-            # The splitter validates that (text + metadata) < chunk_size.
-            # Since global_summary is huge (~1000 chars), it causes a ValueError.
-            # We will inject it manually into the nodes AFTER splitting.
+
             documents = [Document(
-                text=md_content, 
+                text=normalized_markdown,
+                id_=doc_id,
                 metadata={
                     "filename": file.filename,
-                    # "global_summary": global_summary  <-- REMOVED from here to fix ValueError
+                    "doc_id": doc_id,
                 }
             )]
             nodes = parser.get_nodes_from_documents(documents)
+            if not nodes:
+                raise ValueError("No chunks generated from parsed document.")
 
-            # Store metadata without prepending to text
-            # This keeps embeddings focused on actual content
             valid_nodes = []
             for idx, node in enumerate(nodes):
-                # Keep original text - don't dilute with summary
-                # Metadata is accessible during retrieval
+                chunk_id = compute_chunk_id(doc_id, idx)
+                node.id_ = compute_point_uuid(chunk_id)
                 node.metadata["filename"] = file.filename
-                
-                # INJECT SUMMARY HERE
-                node.metadata["global_summary"] = global_summary
-                
+                node.metadata["doc_id"] = doc_id
                 node.metadata["chunk_index"] = idx
+                node.metadata["chunk_id"] = chunk_id
                 node.metadata["total_chunks"] = len(nodes)
-                
+                node.excluded_embed_metadata_keys.extend(
+                    ["filename", "doc_id", "chunk_index", "chunk_id", "total_chunks"]
+                )
                 valid_nodes.append(node)
 
-            # 4. Storage (Dense + Sparse/Hybrid)
             logger.info(f"Upserting {len(valid_nodes)} nodes to Qdrant...")
-            
-            # Setup Hybrid Qdrant Vector Store
             vector_store = QdrantVectorStore(
                 client=self.qdrant_client,
                 collection_name=settings.COLLECTION_NAME,
-                enable_hybrid=True, # Critical for bge-m3 sparse generation
+                enable_hybrid=True,
                 sparse_doc_fn=self.sparse_doc_fn,
                 sparse_query_fn=self.sparse_query_fn,
-                batch_size=20 # Conservative batch size for 6GB VRAM
+                batch_size=settings.UPSERT_BATCH_SIZE,
             )
-            
             storage_context = StorageContext.from_defaults(vector_store=vector_store)
-            
-            # Create Index (triggers embedding generation)
             VectorStoreIndex(
                 valid_nodes,
                 storage_context=storage_context,
@@ -142,7 +145,9 @@ class IngestionService:
                 "filename": file.filename,
                 "status": "ingested",
                 "chunks": len(valid_nodes),
-                "global_summary": global_summary
+                "global_summary": global_summary,
+                "doc_id": doc_id,
+                "replaced_points": replaced_points,
             }
 
         except Exception as e:
@@ -169,3 +174,65 @@ class IngestionService:
         logger.info("Requesting LLM completion (with potential retry)...")
         response = await self.llm.acomplete(prompt)
         return str(response).strip()
+
+    async def _generate_summary(self, markdown_text: str) -> str:
+        summary_prompt = (
+            "Summarize this document for retrieval support. "
+            "Provide 4-6 concise bullets with core topics and key entities. "
+            "Do not speculate.\n\n"
+            f"Document excerpt:\n{markdown_text[:15000]}"
+        )
+        try:
+            summary = await self._generate_summary_with_retry(summary_prompt)
+            return summary[:2000]
+        except Exception as exc:
+            logger.warning("Summary generation failed, using fallback: %s", exc)
+            return self._fallback_summary(markdown_text)
+
+    def _fallback_summary(self, markdown_text: str) -> str:
+        lines = [line.strip() for line in markdown_text.splitlines() if line.strip()]
+        top_lines = lines[:6]
+        if not top_lines:
+            return "Summary unavailable."
+        bullets = "\n".join(f"- {line[:180]}" for line in top_lines)
+        return f"Summary fallback from extracted content:\n{bullets}"
+
+    def _count_chunks_for_doc(self, doc_id: str) -> int:
+        try:
+            result = self.qdrant_client.count(
+                collection_name=settings.COLLECTION_NAME,
+                count_filter=Filter(
+                    must=[FieldCondition(key="doc_id", match=MatchValue(value=doc_id))]
+                ),
+                exact=True,
+            )
+            return int(result.count)
+        except Exception as exc:
+            logger.info("Collection not ready for count (%s)", exc)
+            return 0
+
+    def _delete_points_for_filename(self, filename: str) -> int:
+        try:
+            existing = self.qdrant_client.count(
+                collection_name=settings.COLLECTION_NAME,
+                count_filter=Filter(
+                    must=[FieldCondition(key="filename", match=MatchValue(value=filename))]
+                ),
+                exact=True,
+            )
+            delete_count = int(existing.count)
+            if delete_count == 0:
+                return 0
+
+            self.qdrant_client.delete(
+                collection_name=settings.COLLECTION_NAME,
+                points_selector=Filter(
+                    must=[FieldCondition(key="filename", match=MatchValue(value=filename))]
+                ),
+                wait=True,
+            )
+            logger.info("Deleted %s old chunks for filename=%s", delete_count, filename)
+            return delete_count
+        except Exception as exc:
+            logger.info("Skipping replacement delete for filename=%s: %s", filename, exc)
+            return 0

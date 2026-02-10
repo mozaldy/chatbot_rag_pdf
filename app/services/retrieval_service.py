@@ -1,0 +1,268 @@
+import asyncio
+import logging
+import re
+import time
+from typing import Any, Dict, Sequence
+
+from llama_index.core import VectorStoreIndex
+from llama_index.core.schema import NodeWithScore
+from llama_index.core.vector_stores.types import VectorStoreQueryResult
+from llama_index.vector_stores.qdrant import QdrantVectorStore
+from qdrant_client import AsyncQdrantClient
+
+from app.core.config import settings
+from app.core.llm_setup import get_embedding_model, get_llm, get_sparse_embedding_functions
+from app.services.query_rewrite import rewrite_query_for_retrieval
+from app.services.rag_quality import (
+    build_context_and_sources,
+    fuse_hybrid_results,
+    reciprocal_rank_fusion_ranked,
+)
+from app.services.rerankers import get_reranker
+from app.services.rerankers.lexical import LexicalReranker
+
+
+logger = logging.getLogger(__name__)
+_CITATION_PATTERN = re.compile(r"\[S\d+\]")
+
+
+class RetrievalService:
+    async def answer_query(self, query: str) -> Dict[str, Any]:
+        timings: Dict[str, float] = {}
+        start_total = time.perf_counter()
+        qdrant_client = AsyncQdrantClient(
+            host=settings.QDRANT_HOST,
+            port=settings.QDRANT_PORT,
+            timeout=settings.QDRANT_TIMEOUT,
+        )
+        should_close_client = False
+
+        try:
+            stage_start = time.perf_counter()
+            qdrant_ready, readiness_message = await self._check_qdrant_ready(qdrant_client)
+            timings["qdrant_check_ms"] = self._elapsed_ms(stage_start)
+            if not qdrant_ready:
+                timings["total_ms"] = self._elapsed_ms(start_total)
+                self._log_timings(timings)
+                return {"response": readiness_message, "sources": []}
+            should_close_client = True
+
+            stage_start = time.perf_counter()
+            rewrite_result = await rewrite_query_for_retrieval(query)
+            timings["rewrite_ms"] = self._elapsed_ms(stage_start)
+            retrieval_queries = rewrite_result.retrieval_queries or [query]
+            retrieval_weights = rewrite_result.retrieval_weights or [1.0]
+
+            embed_model = get_embedding_model()
+            sparse_doc_fn, sparse_query_fn = get_sparse_embedding_functions()
+            vector_store = QdrantVectorStore(
+                aclient=qdrant_client,
+                collection_name=settings.COLLECTION_NAME,
+                enable_hybrid=True,
+                sparse_doc_fn=sparse_doc_fn,
+                sparse_query_fn=sparse_query_fn,
+                hybrid_fusion_fn=self._hybrid_fusion,
+            )
+            index = VectorStoreIndex.from_vector_store(
+                vector_store=vector_store,
+                embed_model=embed_model,
+            )
+            retriever = index.as_retriever(
+                vector_store_query_mode="hybrid",
+                similarity_top_k=settings.DENSE_TOP_K,
+                sparse_top_k=settings.SPARSE_TOP_K,
+                alpha=settings.HYBRID_ALPHA,
+            )
+
+            stage_start = time.perf_counter()
+            candidate_lists: list[list[NodeWithScore]] = []
+            for retrieval_query in retrieval_queries:
+                retrieved = await retriever.aretrieve(retrieval_query)
+                candidate_lists.append(list(retrieved[: settings.RERANK_CANDIDATES_K]))
+            timings["retrieve_ms"] = self._elapsed_ms(stage_start)
+
+            stage_start = time.perf_counter()
+            initial_candidates = self._merge_retrieval_candidates(
+                candidate_lists=candidate_lists,
+                weights=retrieval_weights,
+                top_k=settings.RERANK_CANDIDATES_K,
+            )
+            timings["merge_ms"] = self._elapsed_ms(stage_start)
+
+            stage_start = time.perf_counter()
+            reranker = get_reranker()
+            try:
+                reranked = reranker.rerank(
+                    query=rewrite_result.query_for_rerank,
+                    candidates=initial_candidates,
+                    top_k=settings.RERANK_TOP_K,
+                    min_score=settings.RERANK_MIN_SCORE,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Reranker '%s' failed (%s). Falling back to lexical reranker.",
+                    settings.RERANKER_TYPE,
+                    exc,
+                )
+                fallback = LexicalReranker(rrf_k=settings.FUSION_RRF_K)
+                reranked = fallback.rerank(
+                    query=rewrite_result.query_for_rerank,
+                    candidates=initial_candidates,
+                    top_k=settings.RERANK_TOP_K,
+                    min_score=settings.RERANK_MIN_SCORE,
+                )
+            timings["rerank_ms"] = self._elapsed_ms(stage_start)
+
+            if settings.RETRIEVAL_DEBUG_LOGS:
+                logger.info(
+                    "retrieval debug: queries=%s weights=%s initial=%s reranked=%s",
+                    retrieval_queries,
+                    retrieval_weights,
+                    self._compact_candidates(initial_candidates),
+                    self._compact_candidates(reranked),
+                )
+
+            stage_start = time.perf_counter()
+            context_str, sources = build_context_and_sources(
+                nodes=reranked,
+                max_chunk_chars=settings.MAX_CONTEXT_CHARS_PER_CHUNK,
+                max_sources=settings.MAX_SOURCES,
+            )
+            timings["context_ms"] = self._elapsed_ms(stage_start)
+
+            if not sources:
+                timings["total_ms"] = self._elapsed_ms(start_total)
+                self._log_timings(timings)
+                return {
+                    "response": "I could not find relevant evidence in the indexed documents.",
+                    "sources": [],
+                }
+
+            llm = get_llm()
+            prompt = (
+                "You are a retrieval-grounded QA assistant. Use only the provided sources.\n"
+                "Rules:\n"
+                "1) If evidence is insufficient, say you don't have enough information.\n"
+                "2) Cite every factual claim with source IDs like [S1] [S2].\n"
+                "3) Do not cite sources that are not in the provided context.\n"
+                "4) Keep the answer concise but complete.\n\n"
+                f"Question:\n{query}\n\n"
+                f"Sources:\n{context_str}\n\n"
+                "Answer:"
+            )
+
+            stage_start = time.perf_counter()
+            completion = await llm.acomplete(prompt)
+            answer = str(completion).strip()
+            if sources and not _CITATION_PATTERN.search(answer):
+                citation_tail = " ".join(f"[{source['id']}]" for source in sources[:2])
+                answer = f"{answer}\n\nCitations: {citation_tail}"
+            timings["generate_ms"] = self._elapsed_ms(stage_start)
+
+            timings["total_ms"] = self._elapsed_ms(start_total)
+            self._log_timings(timings)
+            return {"response": answer, "sources": sources}
+        finally:
+            if should_close_client:
+                try:
+                    await asyncio.wait_for(qdrant_client.close(), timeout=2.0)
+                except Exception as exc:
+                    logger.debug("Failed to close AsyncQdrantClient cleanly: %s", exc)
+
+    @staticmethod
+    async def _check_qdrant_ready(qdrant_client: AsyncQdrantClient) -> tuple[bool, str]:
+        try:
+            collection_exists = await qdrant_client.collection_exists(
+                collection_name=settings.COLLECTION_NAME
+            )
+        except Exception as exc:
+            logger.warning("Qdrant readiness check failed: %s", exc)
+            return (
+                False,
+                (
+                    "Vector database is unreachable. Start Qdrant with "
+                    "`docker-compose up -d` and retry."
+                ),
+            )
+
+        if not collection_exists:
+            return (
+                False,
+                (
+                    f"No indexed documents found in collection '{settings.COLLECTION_NAME}'. "
+                    "Upload and ingest a PDF first."
+                ),
+            )
+        return True, ""
+
+    @staticmethod
+    def _hybrid_fusion(
+        dense_result: VectorStoreQueryResult,
+        sparse_result: VectorStoreQueryResult,
+        alpha: float = 0.5,
+        top_k: int = 10,
+    ) -> VectorStoreQueryResult:
+        return fuse_hybrid_results(
+            dense_result=dense_result,
+            sparse_result=sparse_result,
+            alpha=alpha,
+            top_k=top_k,
+            mode=settings.FUSION_MODE,
+            k=settings.FUSION_RRF_K,
+        )
+
+    @staticmethod
+    def _elapsed_ms(start_time: float) -> float:
+        return round((time.perf_counter() - start_time) * 1000.0, 2)
+
+    @staticmethod
+    def _compact_candidates(candidates: Sequence[NodeWithScore], limit: int = 8) -> list[dict]:
+        compact: list[dict] = []
+        for candidate in list(candidates)[:limit]:
+            metadata = candidate.node.metadata or {}
+            compact.append(
+                {
+                    "node_id": candidate.node.node_id,
+                    "doc_id": metadata.get("doc_id"),
+                    "chunk_id": metadata.get("chunk_id"),
+                    "score": round(candidate.score, 6)
+                    if candidate.score is not None
+                    else None,
+                }
+            )
+        return compact
+
+    @staticmethod
+    def _log_timings(timings: Dict[str, float]) -> None:
+        logger.info(
+            "chat pipeline timings ms: qdrant_check=%s rewrite=%s retrieve=%s merge=%s rerank=%s context=%s generate=%s total=%s mode=%s alpha=%s reranker=%s rewrite_enabled=%s",
+            timings.get("qdrant_check_ms", 0.0),
+            timings.get("rewrite_ms", 0.0),
+            timings.get("retrieve_ms", 0.0),
+            timings.get("merge_ms", 0.0),
+            timings.get("rerank_ms", 0.0),
+            timings.get("context_ms", 0.0),
+            timings.get("generate_ms", 0.0),
+            timings.get("total_ms", 0.0),
+            settings.FUSION_MODE,
+            settings.HYBRID_ALPHA,
+            settings.RERANKER_TYPE,
+            settings.QUERY_REWRITE_ENABLED,
+        )
+
+    @staticmethod
+    def _merge_retrieval_candidates(
+        candidate_lists: list[list[NodeWithScore]],
+        weights: list[float],
+        top_k: int,
+    ) -> list[NodeWithScore]:
+        if not candidate_lists:
+            return []
+        if len(candidate_lists) == 1:
+            return candidate_lists[0][:top_k]
+        return reciprocal_rank_fusion_ranked(
+            ranked_lists=candidate_lists,
+            top_k=top_k,
+            k=settings.FUSION_RRF_K,
+            weights=weights,
+        )
