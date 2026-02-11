@@ -8,6 +8,7 @@ from app.services.rag_quality import (
     compute_chunk_id,
     compute_document_id,
     compute_point_uuid,
+    diversify_nodes_by_doc,
     fuse_hybrid_results,
     normalize_markdown_text,
     rerank_nodes_by_query,
@@ -63,6 +64,8 @@ class RagQualityUtilityTests(unittest.TestCase):
                 "doc_id": "doc_a",
                 "chunk_id": "doc_a:chunk:00000",
                 "chunk_index": 0,
+                "page_label": "Page 3",
+                "section_title": "Capabilities",
             },
         )
         context, sources = build_context_and_sources(
@@ -75,6 +78,8 @@ class RagQualityUtilityTests(unittest.TestCase):
         self.assertEqual(sources[0]["id"], "S1")
         self.assertEqual(sources[0]["doc_id"], "doc_a")
         self.assertEqual(sources[0]["chunk_id"], "doc_a:chunk:00000")
+        self.assertEqual(sources[0]["page_label"], "Page 3")
+        self.assertEqual(sources[0]["section_title"], "Capabilities")
 
     def test_fuse_hybrid_results_respects_alpha_for_weighted_rrf(self) -> None:
         dense_top = TextNode(id_="dense_top", text="dense")
@@ -147,6 +152,50 @@ class RagQualityUtilityTests(unittest.TestCase):
         )
 
         self.assertEqual([node.node_id for node in high_alpha.nodes], [node.node_id for node in low_alpha.nodes])
+
+    def test_diversify_nodes_by_doc_limits_single_document_dominance(self) -> None:
+        ranked = [
+            NodeWithScore(
+                node=TextNode(id_="a1", text="a1", metadata={"doc_id": "doc_a"}),
+                score=0.95,
+            ),
+            NodeWithScore(
+                node=TextNode(id_="a2", text="a2", metadata={"doc_id": "doc_a"}),
+                score=0.92,
+            ),
+            NodeWithScore(
+                node=TextNode(id_="a3", text="a3", metadata={"doc_id": "doc_a"}),
+                score=0.90,
+            ),
+            NodeWithScore(
+                node=TextNode(id_="b1", text="b1", metadata={"doc_id": "doc_b"}),
+                score=0.88,
+            ),
+            NodeWithScore(
+                node=TextNode(id_="c1", text="c1", metadata={"doc_id": "doc_c"}),
+                score=0.84,
+            ),
+        ]
+        diversified = diversify_nodes_by_doc(
+            nodes=ranked,
+            max_items=4,
+            max_per_doc=1,
+        )
+        self.assertEqual([node.node.node_id for node in diversified], ["a1", "b1", "c1", "a2"])
+
+    def test_diversify_nodes_by_doc_deduplicates_when_no_limit(self) -> None:
+        shared = TextNode(id_="shared", text="shared", metadata={"doc_id": "doc_a"})
+        ranked = [
+            NodeWithScore(node=shared, score=0.9),
+            NodeWithScore(node=shared, score=0.8),
+            NodeWithScore(node=TextNode(id_="b1", text="b1", metadata={"doc_id": "doc_b"}), score=0.7),
+        ]
+        diversified = diversify_nodes_by_doc(
+            nodes=ranked,
+            max_items=3,
+            max_per_doc=0,
+        )
+        self.assertEqual([node.node.node_id for node in diversified], ["shared", "b1"])
 
 
 if __name__ == "__main__":

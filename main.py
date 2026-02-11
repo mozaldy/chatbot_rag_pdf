@@ -2,6 +2,7 @@ import logging
 from fastapi import FastAPI
 from app.api.endpoints import router
 from app.core.llm_setup import init_settings
+from app.services.retrieval_service import RetrievalService
 
 # Configure Logging
 logging.basicConfig(level=logging.INFO)
@@ -12,6 +13,11 @@ app = FastAPI(title="Local RAG API")
 def on_startup():
     # Initialize LlamaIndex Settings (Singleton loading)
     init_settings()
+
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    await RetrievalService.close_qdrant_client()
 
 app.include_router(router, prefix="/api")
 

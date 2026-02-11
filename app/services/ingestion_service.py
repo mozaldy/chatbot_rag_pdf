@@ -1,8 +1,11 @@
+import asyncio
 import os
 import shutil
 import logging
+import re
 from pathlib import Path
 from tempfile import NamedTemporaryFile
+from typing import Sequence
 
 from fastapi import UploadFile
 from docling.document_converter import DocumentConverter, PdfFormatOption
@@ -32,6 +35,10 @@ except ImportError:
     ResourceExhausted = Exception
 
 logger = logging.getLogger(__name__)
+_MARKDOWN_HEADING_PATTERN = re.compile(r"^#{1,6}\s+(.+)$")
+_PAGE_PATTERN = re.compile(r"^page\s*(\d+)(?:\s*(?:of|/)\s*(\d+))?$", re.IGNORECASE)
+_PAGE_RATIO_PATTERN = re.compile(r"^(\d+)\s*(?:of|/)\s*(\d+)$", re.IGNORECASE)
+_PAGE_NUMERIC_PATTERN = re.compile(r"^\d{1,4}$")
 
 class IngestionService:
     def __init__(self):
@@ -48,22 +55,15 @@ class IngestionService:
         temp_path = self._save_upload_file(file)
         try:
             logger.info(f"Parsing PDF with Docling: {file.filename}")
-            pipeline_options = PdfPipelineOptions()
-            pipeline_options.do_ocr = settings.ENABLE_OCR
-            converter = DocumentConverter(
-                format_options={
-                    InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)
-                }
-            )
-            result = converter.convert(temp_path)
-            raw_markdown = result.document.export_to_markdown()
+            raw_markdown = await asyncio.to_thread(self._extract_markdown_from_pdf, temp_path)
             normalized_markdown = normalize_markdown_text(raw_markdown)
+            page_aware_markdown = normalize_markdown_text(raw_markdown, preserve_page_markers=True)
 
             if not normalized_markdown:
                 raise ValueError("No readable content extracted from PDF.")
 
             doc_id = compute_document_id(file.filename, normalized_markdown)
-            existing_chunks = self._count_chunks_for_doc(doc_id)
+            existing_chunks = await asyncio.to_thread(self._count_chunks_for_doc, doc_id)
             if existing_chunks > 0:
                 logger.info(
                     "Skipping duplicate ingestion for %s (doc_id=%s, chunks=%s)",
@@ -80,7 +80,10 @@ class IngestionService:
                     "replaced_points": 0,
                 }
 
-            replaced_points = self._delete_points_for_filename(file.filename)
+            replaced_points = await asyncio.to_thread(
+                self._delete_points_for_filename,
+                file.filename,
+            )
             logger.info(
                 "Prepared ingestion for %s (doc_id=%s, replaced_points=%s)",
                 file.filename,
@@ -91,55 +94,16 @@ class IngestionService:
             logger.info("Generating global summary for %s", file.filename)
             global_summary = await self._generate_summary(normalized_markdown)
 
-            parser = SentenceSplitter(
-                chunk_size=settings.CHUNK_SIZE,
-                chunk_overlap=settings.CHUNK_OVERLAP,
-                paragraph_separator="\n\n",
-                secondary_chunking_regex="[^,.;。？！]+[,.;。？！]?"
+            valid_nodes = await asyncio.to_thread(
+                self._build_nodes,
+                normalized_markdown,
+                page_aware_markdown,
+                doc_id,
+                file.filename,
             )
-
-            documents = [Document(
-                text=normalized_markdown,
-                id_=doc_id,
-                metadata={
-                    "filename": file.filename,
-                    "doc_id": doc_id,
-                }
-            )]
-            nodes = parser.get_nodes_from_documents(documents)
-            if not nodes:
-                raise ValueError("No chunks generated from parsed document.")
-
-            valid_nodes = []
-            for idx, node in enumerate(nodes):
-                chunk_id = compute_chunk_id(doc_id, idx)
-                node.id_ = compute_point_uuid(chunk_id)
-                node.metadata["filename"] = file.filename
-                node.metadata["doc_id"] = doc_id
-                node.metadata["chunk_index"] = idx
-                node.metadata["chunk_id"] = chunk_id
-                node.metadata["total_chunks"] = len(nodes)
-                node.excluded_embed_metadata_keys.extend(
-                    ["filename", "doc_id", "chunk_index", "chunk_id", "total_chunks"]
-                )
-                valid_nodes.append(node)
 
             logger.info(f"Upserting {len(valid_nodes)} nodes to Qdrant...")
-            vector_store = QdrantVectorStore(
-                client=self.qdrant_client,
-                collection_name=settings.COLLECTION_NAME,
-                enable_hybrid=True,
-                sparse_doc_fn=self.sparse_doc_fn,
-                sparse_query_fn=self.sparse_query_fn,
-                batch_size=settings.UPSERT_BATCH_SIZE,
-            )
-            storage_context = StorageContext.from_defaults(vector_store=vector_store)
-            VectorStoreIndex(
-                valid_nodes,
-                storage_context=storage_context,
-                embed_model=self.embed_model,
-                show_progress=True
-            )
+            await asyncio.to_thread(self._upsert_nodes, valid_nodes)
             
             return {
                 "filename": file.filename,
@@ -162,6 +126,187 @@ class IngestionService:
         with NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
             shutil.copyfileobj(upload_file.file, tmp)
             return tmp.name
+
+    def _extract_markdown_from_pdf(self, temp_path: str) -> str:
+        pipeline_options = PdfPipelineOptions()
+        pipeline_options.do_ocr = settings.ENABLE_OCR
+        converter = DocumentConverter(
+            format_options={
+                InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)
+            }
+        )
+        result = converter.convert(temp_path)
+        return result.document.export_to_markdown()
+
+    def _build_nodes(
+        self,
+        normalized_markdown: str,
+        page_aware_markdown: str,
+        doc_id: str,
+        filename: str,
+    ):
+        parser = SentenceSplitter(
+            chunk_size=settings.CHUNK_SIZE,
+            chunk_overlap=settings.CHUNK_OVERLAP,
+            paragraph_separator="\n\n",
+            secondary_chunking_regex="[^,.;。？！]+[,.;。？！]?"
+        )
+
+        documents = [Document(
+            text=normalized_markdown,
+            id_=doc_id,
+            metadata={
+                "filename": filename,
+                "doc_id": doc_id,
+            }
+        )]
+        nodes = parser.get_nodes_from_documents(documents)
+        if not nodes:
+            raise ValueError("No chunks generated from parsed document.")
+
+        section_events = self._extract_section_events(normalized_markdown)
+        page_events = self._extract_page_events(page_aware_markdown)
+        section_positions = self._align_node_positions(nodes, normalized_markdown)
+        page_positions = self._align_node_positions(nodes, page_aware_markdown)
+
+        valid_nodes = []
+        for idx, node in enumerate(nodes):
+            chunk_id = compute_chunk_id(doc_id, idx)
+            node.id_ = compute_point_uuid(chunk_id)
+            section_title = self._event_for_position(section_positions[idx], section_events)
+            page_label = self._event_for_position(page_positions[idx], page_events)
+
+            node.metadata["filename"] = filename
+            node.metadata["doc_id"] = doc_id
+            node.metadata["chunk_index"] = idx
+            node.metadata["chunk_id"] = chunk_id
+            node.metadata["total_chunks"] = len(nodes)
+            node.metadata["section_title"] = section_title or "Document"
+            if page_label:
+                node.metadata["page_label"] = page_label
+            node.excluded_embed_metadata_keys.extend(
+                [
+                    "filename",
+                    "doc_id",
+                    "chunk_index",
+                    "chunk_id",
+                    "total_chunks",
+                    "section_title",
+                    "page_label",
+                ]
+            )
+            valid_nodes.append(node)
+
+        return valid_nodes
+
+    def _extract_section_events(self, text: str) -> list[tuple[int, str]]:
+        events: list[tuple[int, str]] = [(0, "Document")]
+        cursor = 0
+        for line in text.splitlines(keepends=True):
+            match = _MARKDOWN_HEADING_PATTERN.match(line.strip())
+            if match:
+                title = match.group(1).strip()
+                if title:
+                    events.append((cursor, title[:200]))
+            cursor += len(line)
+        return events
+
+    def _extract_page_events(self, text: str) -> list[tuple[int, str]]:
+        events: list[tuple[int, str]] = []
+        cursor = 0
+        for line in text.splitlines(keepends=True):
+            page_label = self._canonical_page_label(line.strip())
+            if page_label:
+                events.append((cursor, page_label))
+            cursor += len(line)
+        return events
+
+    def _canonical_page_label(self, value: str) -> str | None:
+        if not value:
+            return None
+
+        match = _PAGE_PATTERN.fullmatch(value)
+        if match:
+            return f"Page {int(match.group(1))}"
+
+        match = _PAGE_RATIO_PATTERN.fullmatch(value)
+        if match:
+            return f"Page {int(match.group(1))}"
+
+        if _PAGE_NUMERIC_PATTERN.fullmatch(value):
+            number = int(value)
+            if 1 <= number <= 5000:
+                return f"Page {number}"
+        return None
+
+    def _align_node_positions(
+        self,
+        nodes: Sequence,
+        text: str,
+    ) -> list[int | None]:
+        positions: list[int | None] = []
+        cursor = 0
+        for node in nodes:
+            content = (node.get_content() or "").strip()
+            pos = self._find_chunk_position(content, text, cursor)
+            positions.append(pos)
+            if pos is not None:
+                cursor = max(cursor, pos + 120)
+        return positions
+
+    def _find_chunk_position(self, chunk: str, text: str, start: int) -> int | None:
+        if not chunk:
+            return None
+
+        probes = [chunk[:220], chunk[:160], chunk[:100], chunk[:70]]
+        for probe in probes:
+            token = probe.strip()
+            if len(token) < 24:
+                continue
+            idx = text.find(token, start)
+            if idx != -1:
+                return idx
+
+        for probe in probes:
+            token = probe.strip()
+            if len(token) < 24:
+                continue
+            idx = text.find(token)
+            if idx != -1:
+                return idx
+
+        return None
+
+    def _event_for_position(
+        self,
+        position: int | None,
+        events: Sequence[tuple[int, str]],
+    ) -> str | None:
+        if position is None or not events:
+            return None
+        active: str | None = None
+        for offset, label in events:
+            if offset > position:
+                break
+            active = label
+        return active
+
+    def _upsert_nodes(self, valid_nodes) -> None:
+        vector_store = QdrantVectorStore(
+            client=self.qdrant_client,
+            collection_name=settings.COLLECTION_NAME,
+            enable_hybrid=True,
+            sparse_doc_fn=self.sparse_doc_fn,
+            sparse_query_fn=self.sparse_query_fn,
+            batch_size=settings.UPSERT_BATCH_SIZE,
+        )
+        storage_context = StorageContext.from_defaults(vector_store=vector_store)
+        VectorStoreIndex(
+            valid_nodes,
+            storage_context=storage_context,
+            embed_model=self.embed_model,
+            show_progress=True
+        )
     
     @retry(
         retry=retry_if_exception_type(ResourceExhausted),

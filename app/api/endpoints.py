@@ -12,17 +12,53 @@ from app.models.schemas import (
     DocumentDeleteResponse,
     DocumentListResponse,
     DocumentSummary,
+    IngestionBatchResponse,
     IngestionResponse,
 )
 
 router = APIRouter()
 
 
-@router.post("/ingest", response_model=IngestionResponse)
-async def ingest_document(file: UploadFile = File(...)):
+@router.post("/ingest", response_model=IngestionBatchResponse)
+async def ingest_document(files: list[UploadFile] = File(..., alias="file")):
+    if not files:
+        raise HTTPException(status_code=400, detail="No files provided for ingestion.")
+
     service = IngestionService()
-    result = await service.process_pdf(file)
-    return result
+    results: list[IngestionResponse] = []
+
+    for upload in files:
+        filename = upload.filename or "unknown.pdf"
+        if not filename.lower().endswith(".pdf"):
+            results.append(
+                IngestionResponse(
+                    filename=filename,
+                    status="failed",
+                    error="Only PDF files are supported.",
+                )
+            )
+            continue
+
+        try:
+            result = await service.process_pdf(upload)
+            results.append(IngestionResponse(**result))
+        except Exception as exc:
+            results.append(
+                IngestionResponse(
+                    filename=filename,
+                    status="failed",
+                    error=str(exc),
+                )
+            )
+
+    succeeded = sum(1 for item in results if item.status != "failed")
+    failed = len(results) - succeeded
+    return {
+        "results": results,
+        "total_files": len(results),
+        "succeeded": succeeded,
+        "failed": failed,
+    }
 
 @router.delete("/reset", response_model=dict)
 async def reset_database():

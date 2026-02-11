@@ -72,6 +72,16 @@ curl -X POST "http://localhost:8000/api/ingest" \
      -F "file=@/path/to/your/document.pdf"
 ```
 
+Ingest multiple PDFs in one request (repeat the `file` field):
+```bash
+curl -X POST "http://localhost:8000/api/ingest" \
+     -H "accept: application/json" \
+     -H "Content-Type: multipart/form-data" \
+     -F "file=@/path/to/doc1.pdf" \
+     -F "file=@/path/to/doc2.pdf" \
+     -F "file=@/path/to/doc3.pdf"
+```
+
 ### 2. Chat / Query
 Ask a question about the uploaded documents. The system uses Hybrid retrieval (Keyword + Semantic) and re-ranks results using the LLM.
 
@@ -81,6 +91,20 @@ curl -X POST "http://localhost:8000/api/chat" \
      -H "accept: application/json" \
      -H "Content-Type: application/json" \
      -d '{ "messages": "What is the global summary of the document?" }'
+```
+
+You can also send multi-turn conversation history:
+```bash
+curl -X POST "http://localhost:8000/api/chat" \
+     -H "accept: application/json" \
+     -H "Content-Type: application/json" \
+     -d '{
+       "messages": [
+         {"role": "user", "content": "Tell me about OCR support."},
+         {"role": "assistant", "content": "It supports OCR extraction from scanned pages."},
+         {"role": "user", "content": "What are the main limitations?"}
+       ]
+     }'
 ```
 
 ## System Architecture

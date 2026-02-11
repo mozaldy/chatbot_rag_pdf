@@ -37,9 +37,12 @@ class Settings(BaseSettings):
     RERANKER_MAX_LENGTH: int = 512
     RERANK_CANDIDATES_K: int = 24
     RERANK_TOP_K: int = 8
-    RERANK_MIN_SCORE: float | None = None
+    RERANK_MIN_SCORE: float | None = 0.1
     MAX_CONTEXT_CHARS_PER_CHUNK: int = 1800
     MAX_SOURCES: int = 5  # Maximum number of unique sources to display
+    CONTEXT_DIVERSITY_ENABLED: bool = True
+    MAX_SOURCES_PER_DOC: int = 2
+    REQUIRE_VALID_CITATIONS: bool = True
     RETRIEVAL_DEBUG_LOGS: bool = False
 
     # Query Rewrite
@@ -48,6 +51,11 @@ class Settings(BaseSettings):
     QUERY_REWRITE_WEIGHT: float = 0.6  # Weight for rewritten query during multi-query fusion
     QUERY_REWRITE_MAX_TERMS: int = 12
     QUERY_REWRITE_MAX_CHARS: int = 200
+
+    # Conversation-aware Retrieval
+    CONVERSATION_HISTORY_MAX_MESSAGES: int = 8
+    CONVERSATION_STANDALONE_QUERY_ENABLED: bool = True
+    CONVERSATION_STANDALONE_MAX_CHARS: int = 280
 
     UPSERT_BATCH_SIZE: int = 20
     

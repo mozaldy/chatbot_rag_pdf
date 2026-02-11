@@ -2,7 +2,7 @@ import hashlib
 import re
 import unicodedata
 import uuid
-from collections import Counter
+from collections import Counter, defaultdict
 from typing import Any, Dict, Iterable, List, Sequence, Tuple
 
 from llama_index.core.schema import NodeWithScore
@@ -12,7 +12,7 @@ from llama_index.core.vector_stores.types import VectorStoreQueryResult
 DEFAULT_RRF_K = 60
 
 
-def normalize_markdown_text(text: str) -> str:
+def normalize_markdown_text(text: str, preserve_page_markers: bool = False) -> str:
     """Normalize extracted markdown for better chunking and retrieval quality."""
     if not text:
         return ""
@@ -25,7 +25,10 @@ def normalize_markdown_text(text: str) -> str:
     normalized = re.sub(r"(?<=\w)-\n(?=\w)", "", normalized)
 
     lines = normalized.split("\n")
-    cleaned_lines = _drop_probable_boilerplate(lines)
+    cleaned_lines = _drop_probable_boilerplate(
+        lines,
+        preserve_page_markers=preserve_page_markers,
+    )
     normalized = "\n".join(cleaned_lines)
 
     # Normalize horizontal whitespace and blank line runs.
@@ -152,6 +155,53 @@ def rerank_nodes_by_query(
     ]
 
 
+def diversify_nodes_by_doc(
+    nodes: Sequence[NodeWithScore],
+    max_items: int,
+    max_per_doc: int,
+) -> List[NodeWithScore]:
+    """
+    Select ranked nodes while limiting how many chunks come from one document.
+    A second pass fills remaining slots if strict caps remove too many items.
+    """
+    if not nodes or max_items <= 0:
+        return []
+
+    if max_per_doc <= 0:
+        return _dedupe_nodes(nodes, max_items)
+
+    selected: List[NodeWithScore] = []
+    selected_ids: set[str] = set()
+    per_doc_counts: dict[str, int] = defaultdict(int)
+
+    for candidate in nodes:
+        node_id = candidate.node.node_id
+        if node_id in selected_ids:
+            continue
+        doc_key = _doc_key(candidate)
+        if per_doc_counts[doc_key] >= max_per_doc:
+            continue
+        selected.append(candidate)
+        selected_ids.add(node_id)
+        per_doc_counts[doc_key] += 1
+        if len(selected) >= max_items:
+            return selected
+
+    if len(selected) >= max_items:
+        return selected
+
+    for candidate in nodes:
+        node_id = candidate.node.node_id
+        if node_id in selected_ids:
+            continue
+        selected.append(candidate)
+        selected_ids.add(node_id)
+        if len(selected) >= max_items:
+            break
+
+    return selected
+
+
 def build_context_and_sources(
     nodes: Sequence[NodeWithScore],
     max_chunk_chars: int,
@@ -174,6 +224,7 @@ def build_context_and_sources(
             "chunk_id": metadata.get("chunk_id", node_with_score.node.node_id),
             "chunk_index": metadata.get("chunk_index", "?"),
             "page_label": metadata.get("page_label"),
+            "section_title": metadata.get("section_title"),
             "score": round(node_with_score.score, 6)
             if node_with_score.score is not None
             else None,
@@ -190,6 +241,8 @@ def build_context_and_sources(
                     f"doc_id: {source['doc_id']}",
                     f"chunk_id: {source['chunk_id']}",
                     f"chunk_index: {source['chunk_index']}",
+                    f"page_label: {source['page_label'] or 'unknown'}",
+                    f"section_title: {source['section_title'] or 'unknown'}",
                     "content:",
                     snippet,
                 ]
@@ -209,7 +262,32 @@ def _vector_result_to_ranked(result: VectorStoreQueryResult) -> List[NodeWithSco
     return ranked
 
 
-def _drop_probable_boilerplate(lines: Iterable[str]) -> List[str]:
+def _dedupe_nodes(nodes: Sequence[NodeWithScore], max_items: int) -> List[NodeWithScore]:
+    unique: List[NodeWithScore] = []
+    seen_ids: set[str] = set()
+    for candidate in nodes:
+        node_id = candidate.node.node_id
+        if node_id in seen_ids:
+            continue
+        unique.append(candidate)
+        seen_ids.add(node_id)
+        if len(unique) >= max_items:
+            break
+    return unique
+
+
+def _doc_key(candidate: NodeWithScore) -> str:
+    metadata = candidate.node.metadata or {}
+    doc_id = metadata.get("doc_id")
+    if doc_id:
+        return str(doc_id)
+    return f"__node__:{candidate.node.node_id}"
+
+
+def _drop_probable_boilerplate(
+    lines: Iterable[str],
+    preserve_page_markers: bool = False,
+) -> List[str]:
     stripped_lines = [line.strip() for line in lines]
     total = len(stripped_lines) or 1
     short_candidates = [
@@ -228,7 +306,7 @@ def _drop_probable_boilerplate(lines: Iterable[str]) -> List[str]:
             return False
         lowered = stripped.casefold()
 
-        if _looks_like_page_marker(lowered):
+        if not preserve_page_markers and _looks_like_page_marker(lowered):
             return True
 
         repeat_count = counts.get(lowered, 0)
