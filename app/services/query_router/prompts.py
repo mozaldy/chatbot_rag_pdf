@@ -35,9 +35,13 @@ You must output a valid JSON object matching the following schema:
 
 RULES:
 - Do not answer the user's question directly. Only route it.
+- You will be provided with "Chat History" (Riwayat Obrolan) and "Latest Question" (Pertanyaan Terbaru).
+- Evaluate the "Latest Question" in the context of the "Chat History".
+- If the "Latest Question" is a follow-up, contains pronouns, or is incomplete (e.g., "tahun berapa", "dimana itu", "berapa jumlahnya", "siapa dia"), you MUST resolve it into a complete standalone sentence based on the history.
+- In such cases, set "intention" to "SEARCH" and put the resolved complete sentence in "rewritten_query".
 - If the user asks for "Search" or "Find", it is almost always SEARCH.
 - If the user asks for "Summary" or "Summarize" WITH a specific topic, it is SUMMARIZATION.
-- ANY query that lacks specific context (e.g., "Summarize", "Search", "Explain", "Conclusion", "Kesimpulan") MUST be labeled as AMBIGUOUS.
+- ANY query that lacks specific context (e.g., "Summarize", "Search", "Explain", "Conclusion", "Kesimpulan") AND cannot be resolved from history MUST be labeled as AMBIGUOUS.
 - Single word inputs indicating agreement or checking (e.g., "Ok", "Ya", "Sip", "Tes", "Baik") MUST be labeled as AMBIGUOUS (unless strictly CHIT_CHAT like "Halo").
 - The "rewritten_query" must be independent and specific.
 - For SUMMARIZATION, the "rewritten_query" MUST include the specific subject/topic. Do NOT reduce it to generic words like "summary", "conclusion", "ringkasan".

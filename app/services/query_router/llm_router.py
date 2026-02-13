@@ -14,13 +14,28 @@ class LLMQueryRouter(BaseQueryRouter):
     def __init__(self):
         self.llm = get_fast_llm()
 
-    async def route(self, query: str) -> RouteResult:
+    async def route(self, query: str, chat_history: list[dict] | None = None) -> RouteResult:
         """
         Routes the query using the configured Fast LLM.
         """
+        history_str = ""
+        if chat_history:
+            lines = []
+            for msg in chat_history:
+                role = msg.get("role", "").strip().lower()
+                content = msg.get("content", "").strip()
+                if role in ["user", "assistant"] and content:
+                    speaker = "User" if role == "user" else "Assistant"
+                    lines.append(f"{speaker}: {content}")
+            history_str = "\n".join(lines)
+
+        user_content = f"Pertanyaan Terbaru: {query}"
+        if history_str:
+            user_content = f"Riwayat Obrolan:\n{history_str}\n\n{user_content}"
+
         messages = [
             ChatMessage(role="system", content=ROUTER_SYSTEM_PROMPT),
-            ChatMessage(role="user", content=query),
+            ChatMessage(role="user", content=user_content),
         ]
 
         try:

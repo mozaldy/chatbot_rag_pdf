@@ -7,9 +7,8 @@ from app.services.rerankers.base import BaseReranker
 
 
 class LexicalReranker(BaseReranker):
-    def __init__(self, lexical_weight: float = 0.35, rrf_k: int = 60) -> None:
-        self.lexical_weight = lexical_weight
-        self.rrf_k = rrf_k
+    def __init__(self) -> None:
+        pass
 
     def rerank(
         self,
@@ -19,11 +18,8 @@ class LexicalReranker(BaseReranker):
         min_score: float | None = None,
     ) -> list[NodeWithScore]:
         reranked = rerank_nodes_by_query(
-            query=query,
             candidates=candidates,
             top_k=top_k,
-            lexical_weight=self.lexical_weight,
-            k=self.rrf_k,
         )
         if min_score is None:
             return reranked

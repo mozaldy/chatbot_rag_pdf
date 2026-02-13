@@ -100,7 +100,11 @@ class RetrievalService:
             
             # --- QUERY ROUTING ---
             router = get_query_router()
-            route_result = await router.route(user_query)
+            # Pass conversation history (excluding the current query if it's already in messages)
+            # conversation_messages includes the current query at the end if normalize_conversation_messages appended it.
+            # We want history *before* the current query.
+            history_for_router = conversation_messages[:-1] if conversation_messages else []
+            route_result = await router.route(user_query, chat_history=history_for_router)
             
             logger.info(f"Query Routing Result: {route_result.model_dump()}")
 
@@ -213,7 +217,7 @@ class RetrievalService:
                     settings.RERANKER_TYPE,
                     exc,
                 )
-                fallback = LexicalReranker(rrf_k=settings.FUSION_RRF_K)
+                fallback = LexicalReranker()
                 reranked = await asyncio.to_thread(
                     fallback.rerank,
                     rewrite_result.query_for_rerank,
@@ -279,6 +283,10 @@ class RetrievalService:
             llm = get_llm()
             prompt = (
                 "You are a retrieval-grounded QA assistant. Use only the provided sources.\n"
+                "You are allowed to make basic logical deductions and temporal inferences STRICTLY based on the provided context. "
+                "If a number or fact is presented next to references like 'increased from [Previous Year]' or accompanied by a chart caption indicating a specific year (e.g., 'Data for 2023'), "
+                "you MUST deduce that the data belongs to that current timeframe/year. Do not consider this hallucination. "
+                "You must still cite the source ID [Sx] where you drew this logical conclusion.\n"
                 "Rules:\n"
                 "1) If evidence is insufficient, say you don't have enough information.\n"
                 "2) Cite every factual claim with source IDs like [S1] [S2].\n"
@@ -415,10 +423,7 @@ class RetrievalService:
         return fuse_hybrid_results(
             dense_result=dense_result,
             sparse_result=sparse_result,
-            alpha=alpha,
             top_k=top_k,
-            mode=settings.FUSION_MODE,
-            k=settings.FUSION_RRF_K,
         )
 
     @staticmethod
@@ -526,6 +531,4 @@ class RetrievalService:
         return reciprocal_rank_fusion_ranked(
             ranked_lists=candidate_lists,
             top_k=top_k,
-            k=settings.FUSION_RRF_K,
-            weights=weights,
         )
