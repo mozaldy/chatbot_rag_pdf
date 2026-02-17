@@ -37,7 +37,7 @@ class Settings(BaseSettings):
     RERANKER_MAX_LENGTH: int = 512
     RERANK_CANDIDATES_K: int = 24
     RERANK_TOP_K: int = 8
-    RERANK_MIN_SCORE: float | None = 0.1
+    RERANK_MIN_SCORE: float | None = 0.001
     MAX_CONTEXT_CHARS_PER_CHUNK: int = 1800
     MAX_SOURCES: int = 5  # Maximum number of unique sources to display
     CONTEXT_DIVERSITY_ENABLED: bool = True

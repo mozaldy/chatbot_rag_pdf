@@ -26,6 +26,7 @@ from app.services.rag_quality import (
 )
 from app.services.rerankers import get_reranker
 from app.services.rerankers.lexical import LexicalReranker
+from app.services.query_router import get_query_router, RouteIntention
 
 
 logger = logging.getLogger(__name__)
@@ -96,10 +97,64 @@ class RetrievalService:
                 return {"response": readiness_message, "sources": []}
 
             stage_start = time.perf_counter()
-            retrieval_query = await self._standalone_retrieval_query(
-                user_query=user_query,
-                conversation_messages=conversation_messages,
-            )
+            
+            # --- QUERY ROUTING ---
+            router = get_query_router()
+            # Pass conversation history (excluding the current query if it's already in messages)
+            # conversation_messages includes the current query at the end if normalize_conversation_messages appended it.
+            # We want history *before* the current query.
+            history_for_router = conversation_messages[:-1] if conversation_messages else []
+            route_result = await router.route(user_query, chat_history=history_for_router)
+            
+            logger.info(f"Query Routing Result: {route_result.model_dump()}")
+
+            # Prioritize Clarification if present, even if intention is not AMBIGUOUS
+            if route_result.intention == RouteIntention.AMBIGUOUS or (route_result.clarification_question and len(route_result.clarification_question) > 5):
+                timings["total_ms"] = self._elapsed_ms(start_total)
+                self._log_timings(timings)
+                return {
+                    "response": route_result.clarification_question or "Mohon maaf, pertanyaan Anda kurang jelas. Bisa tolong diperjelas?",
+                    "sources": [],
+                }
+
+            if route_result.intention == RouteIntention.CHIT_CHAT:
+                # Handle chit-chat directly with LLM (no RAG)
+                llm = get_fast_llm()
+                prompt = (
+                    "You are a helpful assistant for a document knowledge base. "
+                    "Engage in the conversation politely and concisely. "
+                    "Do not mention technical terms like 'LLM', 'RAG', 'AI model', or 'vector database'. "
+                    "Act as a friendly guide helping the user find information.\n"
+                    "Use Bahasa Indonesia for the response.\n"
+                    f"User: {user_query}\n"
+                    "Assistant:"
+                )
+                completion = await llm.acomplete(prompt)
+                timings["total_ms"] = self._elapsed_ms(start_total)
+                self._log_timings(timings)
+                return {
+                    "response": str(completion).strip(),
+                    "sources": [],
+                }
+
+            # For SEARCH / SUMMARIZATION, use the rewritten query
+            retrieval_query = route_result.rewritten_query or user_query
+            
+            # Safety checks for bad rewrites (e.g. "kesimpulan" -> "kesimpulan")
+            # If the rewritten query is just a generic word, fall back to the user query (or extract topic from it if possible)
+            # But simplistic fallback is safest.
+            generic_keywords = {"summary", "summarize", "conclusion", "ringkasan", "kesimpulan", "rangkuman"}
+            if retrieval_query.strip().lower() in generic_keywords:
+                 logger.warning(
+                     "Router produced generic query '%s'. Reverting to user query '%s'.", 
+                     retrieval_query, 
+                     user_query
+                 )
+                 retrieval_query = user_query
+            
+            # Optional: If enabling context history rewrite on top of router (usually not needed if router is smart)
+            # But let's respect the router's rewrite as definitive for now.
+            
             timings["conversation_ms"] = self._elapsed_ms(stage_start)
 
             stage_start = time.perf_counter()
@@ -162,7 +217,7 @@ class RetrievalService:
                     settings.RERANKER_TYPE,
                     exc,
                 )
-                fallback = LexicalReranker(rrf_k=settings.FUSION_RRF_K)
+                fallback = LexicalReranker()
                 reranked = await asyncio.to_thread(
                     fallback.rerank,
                     rewrite_result.query_for_rerank,
@@ -204,19 +259,41 @@ class RetrievalService:
             if not sources:
                 timings["total_ms"] = self._elapsed_ms(start_total)
                 self._log_timings(timings)
+                
+                # Dynamic "No Results" response in Bahasa Indonesia
+                llm = get_fast_llm()
+                prompt = (
+                    "User asked: '{user_query}'\n"
+                    "I searched the knowledge base but found no relevant documents.\n"
+                    "Generate a polite apology in Bahasa Indonesia stating that no information was found "
+                    "and suggesting they try a different query.\n"
+                    "Do NOT start with 'Tentu', 'Baik', 'Mohon maaf', or 'Berikut'. Just say 'Saya tidak dapat menemukan info...' directly."
+                )
+                try:
+                    completion = await llm.acomplete(prompt)
+                    response_text = str(completion).strip()
+                except Exception:
+                    response_text = "Maaf, saya tidak menemukan informasi yang relevan dalam dokumen."
+
                 return {
-                    "response": "I could not find relevant evidence in the indexed documents.",
+                    "response": response_text,
                     "sources": [],
                 }
 
             llm = get_llm()
             prompt = (
                 "You are a retrieval-grounded QA assistant. Use only the provided sources.\n"
+                "You are allowed to make basic logical deductions and temporal inferences STRICTLY based on the provided context. "
+                "If a number or fact is presented next to references like 'increased from [Previous Year]' or accompanied by a chart caption indicating a specific year (e.g., 'Data for 2023'), "
+                "you MUST deduce that the data belongs to that current timeframe/year. Do not consider this hallucination. "
+                "You must still cite the source ID [Sx] where you drew this logical conclusion.\n"
                 "Rules:\n"
                 "1) If evidence is insufficient, say you don't have enough information.\n"
                 "2) Cite every factual claim with source IDs like [S1] [S2].\n"
                 "3) Do not cite sources that are not in the provided context.\n"
-                "4) Keep the answer concise but complete.\n\n"
+                "4) Keep the answer concise but complete.\n"
+                "5) ANSWER IN BAHASA INDONESIA.\n"
+                "6) Do not start with 'Tentu', 'Baik', 'Berikut adalah', or similar fillers. Answer directly.\n\n"
                 f"Conversation context (may help resolve references):\n{conversation_context or 'N/A'}\n\n"
                 f"Question:\n{user_query}\n\n"
                 f"Sources:\n{context_str}\n\n"
@@ -346,10 +423,7 @@ class RetrievalService:
         return fuse_hybrid_results(
             dense_result=dense_result,
             sparse_result=sparse_result,
-            alpha=alpha,
             top_k=top_k,
-            mode=settings.FUSION_MODE,
-            k=settings.FUSION_RRF_K,
         )
 
     @staticmethod
@@ -385,6 +459,11 @@ class RetrievalService:
             "do not have enough information",
             "insufficient evidence",
             "not enough information",
+            "tidak memiliki informasi",
+            "tidak cukup informasi",
+            "tidak ada informasi",
+            "maaf", # Be careful with this, but usually "Maaf, saya tidak..." indicates failure in this context
+            "kurang informasi",
         )
         return any(marker in normalized for marker in markers)
 
@@ -452,6 +531,4 @@ class RetrievalService:
         return reciprocal_rank_fusion_ranked(
             ranked_lists=candidate_lists,
             top_k=top_k,
-            k=settings.FUSION_RRF_K,
-            weights=weights,
         )

@@ -9,7 +9,7 @@ from llama_index.core.schema import NodeWithScore
 from llama_index.core.vector_stores.types import VectorStoreQueryResult
 
 
-DEFAULT_RRF_K = 60
+from app.core.config import settings
 
 
 def normalize_markdown_text(text: str, preserve_page_markers: bool = False) -> str:
@@ -57,28 +57,22 @@ def compute_point_uuid(chunk_id: str) -> str:
 def reciprocal_rank_fusion_ranked(
     ranked_lists: Sequence[Sequence[NodeWithScore]],
     top_k: int,
-    k: int = DEFAULT_RRF_K,
-    weights: Sequence[float] | None = None,
 ) -> List[NodeWithScore]:
-    """Fuse ranked candidate lists with Reciprocal Rank Fusion."""
+    """Fuse ranked candidate lists with Standard Reciprocal Rank Fusion."""
     fused: Dict[str, Tuple[NodeWithScore, float]] = {}
     if not ranked_lists:
         return []
 
-    if weights is None:
-        normalized_weights = [1.0] * len(ranked_lists)
-    else:
-        if len(weights) != len(ranked_lists):
-            raise ValueError("weights length must match ranked_lists length")
-        normalized_weights = [max(0.0, float(weight)) for weight in weights]
-        if sum(normalized_weights) == 0:
-            normalized_weights = [1.0] * len(ranked_lists)
+    # Use k from settings, avoiding hardcoded values
+    k = settings.FUSION_RRF_K
 
-    for list_idx, ranked_nodes in enumerate(ranked_lists):
-        list_weight = normalized_weights[list_idx]
+    for ranked_nodes in ranked_lists:
         for rank, node_with_score in enumerate(ranked_nodes, start=1):
             node_id = node_with_score.node.node_id
-            score = list_weight / (rank + k)
+            # Standard RRF formula: 1 / (k + rank)
+            # No weights applied, treating all lists equally.
+            score = 1.0 / (k + rank)
+            
             if node_id in fused:
                 fused[node_id] = (fused[node_id][0], fused[node_id][1] + score)
             else:
@@ -91,30 +85,16 @@ def reciprocal_rank_fusion_ranked(
 def fuse_hybrid_results(
     dense_result: VectorStoreQueryResult,
     sparse_result: VectorStoreQueryResult,
-    alpha: float,
     top_k: int,
-    mode: str = "weighted_rrf",
-    k: int = DEFAULT_RRF_K,
 ) -> VectorStoreQueryResult:
-    """Fuse dense and sparse retrieval results using configurable RRF variants."""
+    """Fuse dense and sparse retrieval results using standard RRF."""
     dense_ranked = _vector_result_to_ranked(dense_result)
     sparse_ranked = _vector_result_to_ranked(sparse_result)
-    fusion_mode = mode.strip().lower()
 
-    if fusion_mode == "weighted_rrf":
-        dense_weight = min(max(alpha, 0.0), 1.0)
-        sparse_weight = 1.0 - dense_weight
-        weights = [dense_weight, sparse_weight]
-    elif fusion_mode == "rrf":
-        weights = [1.0, 1.0]
-    else:
-        raise ValueError(f"Unsupported fusion mode: {mode}")
-
+    # Simplified fusion: always use standard RRF without weights
     fused_ranked = reciprocal_rank_fusion_ranked(
         ranked_lists=[dense_ranked, sparse_ranked],
         top_k=top_k,
-        k=k,
-        weights=weights,
     )
     fused_nodes = [node_with_score.node for node_with_score in fused_ranked]
     fused_scores = [node_with_score.score for node_with_score in fused_ranked]
@@ -123,36 +103,26 @@ def fuse_hybrid_results(
 
 
 def rerank_nodes_by_query(
-    query: str,
     candidates: Sequence[NodeWithScore],
     top_k: int,
-    lexical_weight: float = 0.35,
-    k: int = DEFAULT_RRF_K,
 ) -> List[NodeWithScore]:
     """
-    Re-rank candidates with a blend of rank signal and lexical overlap.
-    Works with hybrid retrieval scores that are not 0-1 normalized.
+    Sort candidates purely by their existing score (e.g. from Cross-Encoder).
+    Removes manual lexical blending to preserve probability calibration.
     """
     if not candidates:
         return []
 
-    query_terms = _query_terms(query)
-    if not query_terms:
-        return list(candidates[:top_k])
+    # Sort purely by the reranker's score (descending)
+    # If score is None, we treat it as -infinity or handle gracefully, 
+    # but here we assume reranker provides scores.
+    sorted_candidates = sorted(
+        candidates, 
+        key=lambda node: node.score if node.score is not None else -1.0, 
+        reverse=True
+    )
 
-    scored: List[Tuple[NodeWithScore, float]] = []
-    for rank, candidate in enumerate(candidates, start=1):
-        rank_signal = 1.0 / (rank + k)
-        chunk_text = candidate.node.get_content().lower()
-        lexical = _lexical_overlap(query_terms, chunk_text)
-        fused_score = (1 - lexical_weight) * rank_signal + lexical_weight * lexical
-        scored.append((candidate, fused_score))
-
-    scored.sort(key=lambda item: item[1], reverse=True)
-    return [
-        NodeWithScore(node=item[0].node, score=item[1])
-        for item in scored[:top_k]
-    ]
+    return list(sorted_candidates[:top_k])
 
 
 def diversify_nodes_by_doc(
@@ -329,15 +299,7 @@ def _looks_like_page_marker(lowered: str) -> bool:
     )
 
 
-def _query_terms(query: str) -> set[str]:
-    return {token for token in re.findall(r"[a-zA-Z0-9]{2,}", query.lower())}
 
-
-def _lexical_overlap(query_terms: set[str], text: str) -> float:
-    if not query_terms:
-        return 0.0
-    hits = sum(1 for term in query_terms if term in text)
-    return hits / float(len(query_terms))
 
 
 def _trim_text(text: str, max_chars: int) -> str:
