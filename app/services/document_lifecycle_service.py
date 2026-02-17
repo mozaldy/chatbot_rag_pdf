@@ -38,7 +38,7 @@ class DocumentLifecycleService:
     def get_document(self, doc_id: str) -> Dict[str, Any] | None:
         docs, _scanned_points, _truncated = self._collect_documents(
             scroll_filter=Filter(
-                must=[FieldCondition(key="doc_id", match=MatchValue(value=doc_id))]
+                must=[FieldCondition(key="source_doc_id", match=MatchValue(value=doc_id))]
             ),
             max_points=settings.DOCUMENT_LIST_MAX_POINTS,
             page_size=settings.DOCUMENT_LIST_PAGE_SIZE,
@@ -47,7 +47,7 @@ class DocumentLifecycleService:
 
     def delete_by_doc_id(self, doc_id: str) -> Dict[str, Any]:
         deleted_chunks = self._delete_by_filter(
-            key="doc_id",
+            key="source_doc_id",
             value=doc_id,
         )
         if deleted_chunks == 0:
@@ -151,11 +151,16 @@ class DocumentLifecycleService:
 
         cleaned_documents = {}
         for doc_id, item in documents.items():
+            chunk_kind_counts = dict(sorted(item["chunk_kind_counts"].items()))
             cleaned = {
-                "doc_id": item["doc_id"],
+                "doc_id": item["source_doc_id"],
                 "filename": item["filename"],
                 "chunks": item["chunks"],
                 "max_chunk_index": item["max_chunk_index"],
+                "table_parent_chunks": chunk_kind_counts.get("table_parent", 0),
+                "table_anchor_chunks": chunk_kind_counts.get("table_anchor", 0),
+                "chunk_kind_counts": chunk_kind_counts,
+                "schema_versions": sorted(item["schema_versions"]),
             }
             cleaned_documents[doc_id] = cleaned
 
@@ -166,21 +171,29 @@ class DocumentLifecycleService:
         documents: Dict[str, Dict[str, Any]],
         payload: Dict[str, Any],
     ) -> None:
-        doc_id = str(payload.get("doc_id", "unknown"))
+        doc_id = str(payload.get("source_doc_id", "unknown"))
         filename = str(payload.get("filename", "unknown"))
         chunk_index_raw = payload.get("chunk_index")
         chunk_index = chunk_index_raw if isinstance(chunk_index_raw, int) else None
+        chunk_kind_raw = payload.get("chunk_kind") or payload.get("content_type") or "text"
+        chunk_kind = str(chunk_kind_raw)
+        schema_version = payload.get("schema_version")
 
         if doc_id not in documents:
             documents[doc_id] = {
-                "doc_id": doc_id,
+                "source_doc_id": doc_id,
                 "filename": filename,
                 "chunks": 0,
                 "max_chunk_index": None,
+                "chunk_kind_counts": {},
+                "schema_versions": set(),
             }
 
         target = documents[doc_id]
         target["chunks"] += 1
+        target["chunk_kind_counts"][chunk_kind] = target["chunk_kind_counts"].get(chunk_kind, 0) + 1
+        if isinstance(schema_version, int):
+            target["schema_versions"].add(schema_version)
         if chunk_index is not None:
             current = target["max_chunk_index"]
             target["max_chunk_index"] = chunk_index if current is None else max(current, chunk_index)

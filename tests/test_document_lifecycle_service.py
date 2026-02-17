@@ -63,14 +63,14 @@ class DocumentLifecycleServiceTests(unittest.TestCase):
             scroll_pages=[
                 (
                     [
-                        _FakeRecord("p1", {"doc_id": "doc_a", "filename": "a.pdf", "chunk_index": 0}),
-                        _FakeRecord("p2", {"doc_id": "doc_a", "filename": "a.pdf", "chunk_index": 1}),
+                        _FakeRecord("p1", {"source_doc_id": "doc_a", "filename": "a.pdf", "chunk_index": 0}),
+                        _FakeRecord("p2", {"source_doc_id": "doc_a", "filename": "a.pdf", "chunk_index": 1}),
                     ],
                     "offset_1",
                 ),
                 (
                     [
-                        _FakeRecord("p3", {"doc_id": "doc_b", "filename": "b.pdf", "chunk_index": 0}),
+                        _FakeRecord("p3", {"source_doc_id": "doc_b", "filename": "b.pdf", "chunk_index": 0}),
                     ],
                     None,
                 ),
@@ -93,14 +93,14 @@ class DocumentLifecycleServiceTests(unittest.TestCase):
             scroll_pages=[
                 (
                     [
-                        _FakeRecord("p1", {"doc_id": "doc_a", "filename": "a.pdf", "chunk_index": 0}),
-                        _FakeRecord("p2", {"doc_id": "doc_b", "filename": "b.pdf", "chunk_index": 0}),
+                        _FakeRecord("p1", {"source_doc_id": "doc_a", "filename": "a.pdf", "chunk_index": 0}),
+                        _FakeRecord("p2", {"source_doc_id": "doc_b", "filename": "b.pdf", "chunk_index": 0}),
                     ],
                     "offset_1",
                 ),
                 (
                     [
-                        _FakeRecord("p3", {"doc_id": "doc_c", "filename": "c.pdf", "chunk_index": 0}),
+                        _FakeRecord("p3", {"source_doc_id": "doc_c", "filename": "c.pdf", "chunk_index": 0}),
                     ],
                     None,
                 ),
@@ -124,8 +124,8 @@ class DocumentLifecycleServiceTests(unittest.TestCase):
             scroll_pages=[
                 (
                     [
-                        _FakeRecord("p1", {"doc_id": "doc_x", "filename": "x.pdf", "chunk_index": 0}),
-                        _FakeRecord("p2", {"doc_id": "doc_x", "filename": "x.pdf", "chunk_index": 2}),
+                        _FakeRecord("p1", {"source_doc_id": "doc_x", "filename": "x.pdf", "chunk_index": 0}),
+                        _FakeRecord("p2", {"source_doc_id": "doc_x", "filename": "x.pdf", "chunk_index": 2}),
                     ],
                     None,
                 )
@@ -141,7 +141,7 @@ class DocumentLifecycleServiceTests(unittest.TestCase):
         self.assertEqual(result["max_chunk_index"], 2)
 
     def test_delete_by_doc_id_returns_deleted_with_chunk_count(self) -> None:
-        client = _FakeQdrantClient(counts={("doc_id", "doc_a"): 4})
+        client = _FakeQdrantClient(counts={("source_doc_id", "doc_a"): 4})
         service = DocumentLifecycleService(client=client)
 
         result = service.delete_by_doc_id("doc_a")

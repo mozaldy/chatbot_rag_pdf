@@ -20,7 +20,13 @@ router = APIRouter()
 
 
 @router.post("/ingest", response_model=IngestionBatchResponse)
-async def ingest_document(files: list[UploadFile] = File(..., alias="file")):
+async def ingest_document(
+    files: list[UploadFile] = File(..., alias="file"),
+    include_markdown: bool = Query(
+        default=False,
+        description="Include full normalized markdown in successful ingestion results.",
+    ),
+):
     if not files:
         raise HTTPException(status_code=400, detail="No files provided for ingestion.")
 
@@ -40,7 +46,10 @@ async def ingest_document(files: list[UploadFile] = File(..., alias="file")):
             continue
 
         try:
-            result = await service.process_pdf(upload)
+            result = await service.process_pdf(
+                upload,
+                include_markdown=include_markdown,
+            )
             results.append(IngestionResponse(**result))
         except Exception as exc:
             results.append(

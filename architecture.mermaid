@@ -1,0 +1,41 @@
+flowchart TD
+    %% -------------------------------------------------------------------------
+    %% Architecture (Updated): FastAPI + LlamaIndex + Qdrant + Reranker
+    %% -------------------------------------------------------------------------
+
+    %% External actors
+    PDF[PDF Upload]
+    USER[User Question]
+
+    %% API layer
+    subgraph API[FastAPI Layer]
+        INGEST_EP["POST /api/ingest"]
+        CHAT_EP["POST /api/chat"]
+    end
+
+    %% Worker / RAG layer
+    subgraph RAG[RAG Worker + LlamaIndex]
+        %% Ingestion pipeline
+        DOCLING["Docling (PDF Parsing + OCR optional)"]
+        NORM["Markdown Normalization"]
+        CHUNK["Chunking + Metadata\n(doc_id, chunk_id, page_label, section_title)"]
+        EMBED_DOC["BAAI/bge-m3 Embedding\n(Dense + Sparse)"]
+        STORE["Qdrant Vector DB\n(Store Chunks + Embeddings)"]
+
+        %% Query pipeline
+        CONV["Conversation Normalization\n(+ standalone query rewrite)"]
+        EMBED_QUERY["BAAI/bge-m3 Query Embedding"]
+        RETRIEVE["Hybrid Retrieval from Qdrant\n(Dense + Sparse Fusion)"]
+        RERANK["Reranker\n(Cross-Encoder or Lexical)"]
+        CONTEXT["Top Context Chunks\n(diversified + source IDs)"]
+        LLM["LLM Answer Generation"]
+        CITECHK["Citation Validation\n(retry if invalid)"]
+        ANSWER["Synthesized Final Answer"]
+    end
+
+    %% Ingestion flow
+    PDF --> INGEST_EP --> DOCLING --> NORM --> CHUNK --> EMBED_DOC --> STORE
+
+    %% Chat flow
+    USER --> CHAT_EP --> CONV --> EMBED_QUERY --> RETRIEVE --> RERANK --> CONTEXT --> LLM --> CITECHK --> ANSWER --> CHAT_EP
+    STORE --> RETRIEVE

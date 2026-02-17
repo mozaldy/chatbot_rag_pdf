@@ -1,9 +1,28 @@
-import streamlit as st
+import os
+
 import requests
+import streamlit as st
 
 # Configuration
-API_URL = "http://localhost:8000/api"
-REQUEST_TIMEOUT = 60
+def _timeout_from_env(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+API_URL = os.getenv("RAG_API_URL", "http://localhost:8000/api")
+CONNECT_TIMEOUT = _timeout_from_env("CONNECT_TIMEOUT_SECONDS", 5.0)
+REQUEST_TIMEOUT = _timeout_from_env("REQUEST_TIMEOUT_SECONDS", 60.0)
+INGEST_REQUEST_TIMEOUT = _timeout_from_env("INGEST_REQUEST_TIMEOUT_SECONDS", 600.0)
+
+
+def _request_timeout(read_timeout: float) -> tuple[float, float]:
+    return CONNECT_TIMEOUT, read_timeout
 
 
 def _api_error_message(response: requests.Response) -> str:
@@ -29,7 +48,7 @@ def _fetch_documents(max_points: int) -> tuple[dict | None, str | None]:
         response = requests.get(
             f"{API_URL}/documents",
             params={"max_points": max_points},
-            timeout=REQUEST_TIMEOUT,
+            timeout=_request_timeout(REQUEST_TIMEOUT),
         )
         if response.status_code == 200:
             return response.json(), None
@@ -37,9 +56,61 @@ def _fetch_documents(max_points: int) -> tuple[dict | None, str | None]:
     except Exception as exc:
         return None, str(exc)
 
+
+def _extract_markdown_previews(payload: dict) -> list[dict]:
+    results = payload.get("results", []) if isinstance(payload, dict) else []
+    previews: list[dict] = []
+    for result in results:
+        if not isinstance(result, dict):
+            continue
+        markdown = result.get("ingested_markdown")
+        if isinstance(markdown, str) and markdown.strip():
+            previews.append(
+                {
+                    "filename": result.get("filename", "unknown.pdf"),
+                    "doc_id": result.get("doc_id"),
+                    "chunks": result.get("chunks"),
+                    "chunking_schema_version": result.get("chunking_schema_version"),
+                    "table_parent_count": result.get("table_parent_count", 0),
+                    "table_anchor_count": result.get("table_anchor_count", 0),
+                    "table_visual_done_count": result.get("table_visual_done_count", 0),
+                    "table_visual_pending_count": result.get("table_visual_pending_count", 0),
+                    "table_visual_failed_count": result.get("table_visual_failed_count", 0),
+                    "table_visual_selected_count": result.get("table_visual_selected_count", 0),
+                    "table_visual_skipped_count": result.get("table_visual_skipped_count", 0),
+                    "chunk_diagnostics": result.get("chunk_diagnostics", []),
+                    "markdown": markdown,
+                }
+            )
+    return previews
+
+
+def _summarize_ingestion_payload(payload: dict) -> dict:
+    if not isinstance(payload, dict):
+        return payload
+    summarized = dict(payload)
+    raw_results = summarized.get("results")
+    if not isinstance(raw_results, list):
+        return summarized
+    compact_results = []
+    for item in raw_results:
+        if not isinstance(item, dict):
+            compact_results.append(item)
+            continue
+        compact_item = dict(item)
+        markdown = compact_item.get("ingested_markdown")
+        if isinstance(markdown, str):
+            compact_item["ingested_markdown"] = f"<{len(markdown)} chars>"
+        compact_results.append(compact_item)
+    summarized["results"] = compact_results
+    return summarized
+
 st.set_page_config(page_title="Local RAG Chat", page_icon="🤖", layout="wide")
 
 st.title("🤖 Local RAG (PDF Query)")
+
+if "latest_ingestion_markdown_previews" not in st.session_state:
+    st.session_state["latest_ingestion_markdown_previews"] = []
 
 # Sidebar for Ingestion
 with st.sidebar:
@@ -58,7 +129,12 @@ with st.sidebar:
                         ("file", (uploaded_file.name, uploaded_file, "application/pdf"))
                         for uploaded_file in uploaded_files
                     ]
-                    response = requests.post(f"{API_URL}/ingest", files=files, timeout=REQUEST_TIMEOUT)
+                    response = requests.post(
+                        f"{API_URL}/ingest",
+                        params={"include_markdown": "true"},
+                        files=files,
+                        timeout=_request_timeout(INGEST_REQUEST_TIMEOUT),
+                    )
                     
                     if response.status_code == 200:
                         payload = response.json()
@@ -68,6 +144,7 @@ with st.sidebar:
 
                         if succeeded > 0:
                             _invalidate_document_cache()
+                        st.session_state["latest_ingestion_markdown_previews"] = _extract_markdown_previews(payload)
                         if failed == 0:
                             st.success(f"✅ Ingestion completed: {succeeded}/{total_files} files succeeded.")
                         elif succeeded == 0:
@@ -77,9 +154,15 @@ with st.sidebar:
                                 f"⚠️ Partial ingestion: {succeeded}/{total_files} succeeded, {failed} failed."
                             )
 
-                        st.json(payload)
+                        st.json(_summarize_ingestion_payload(payload))
                     else:
                         st.error(f"❌ Error: {_api_error_message(response)}")
+                except requests.exceptions.ReadTimeout:
+                    st.error(
+                        "❌ Ingestion request timed out. "
+                        f"Set `INGEST_REQUEST_TIMEOUT_SECONDS` higher than {INGEST_REQUEST_TIMEOUT:g} "
+                        "for large PDFs."
+                    )
                 except Exception as e:
                     st.error(f"❌ Connection Error: {e}")
 
@@ -88,7 +171,10 @@ with st.sidebar:
     if st.button("⚠️ Reset Database", type="primary", help="Deletes all vectors and resets the collection"):
         with st.spinner("Resetting database..."):
             try:
-                response = requests.delete(f"{API_URL}/reset", timeout=REQUEST_TIMEOUT)
+                response = requests.delete(
+                    f"{API_URL}/reset",
+                    timeout=_request_timeout(REQUEST_TIMEOUT),
+                )
                 if response.status_code == 200:
                     _invalidate_document_cache()
                     st.success("✅ Database Reset Successfully!")
@@ -146,6 +232,9 @@ with st.sidebar:
                     "doc_id": doc.get("doc_id", "unknown"),
                     "chunks": doc.get("chunks", 0),
                     "max_chunk_index": doc.get("max_chunk_index"),
+                    "table_parent_chunks": doc.get("table_parent_chunks", 0),
+                    "table_anchor_chunks": doc.get("table_anchor_chunks", 0),
+                    "schema_versions": ", ".join(str(v) for v in (doc.get("schema_versions") or [])) or "n/a",
                 }
                 for doc in documents
             ]
@@ -167,7 +256,7 @@ with st.sidebar:
                     response = requests.delete(
                         f"{API_URL}/documents/by-filename",
                         params={"filename": selected_filename},
-                        timeout=REQUEST_TIMEOUT,
+                        timeout=_request_timeout(REQUEST_TIMEOUT),
                     )
                     if response.status_code == 200:
                         st.success(f"✅ Deleted chunks for filename '{selected_filename}'")
@@ -179,6 +268,61 @@ with st.sidebar:
                     st.error(f"❌ Connection Error: {exc}")
         else:
             st.info("No indexed documents yet. Ingest a PDF to populate this list.")
+
+preview_items = st.session_state.get("latest_ingestion_markdown_previews", [])
+if preview_items:
+    st.subheader("Latest Ingestion Markdown")
+    st.caption(
+        "These are the full structure-aware markdown outputs used for indexing. "
+        "Use this to verify ingestion quality and chunking behavior without prompting the LLM."
+    )
+    if st.button("Clear Markdown Preview"):
+        st.session_state["latest_ingestion_markdown_previews"] = []
+        st.rerun()
+    for idx, item in enumerate(preview_items):
+        with st.expander(
+            f"{item['filename']} | doc_id={item.get('doc_id') or 'n/a'} | chunks={item.get('chunks')}",
+            expanded=False,
+        ):
+            st.caption(
+                " | ".join(
+                    [
+                        f"schema_v={item.get('chunking_schema_version') or 'n/a'}",
+                        f"table_parent={item.get('table_parent_count', 0)}",
+                        f"table_anchor={item.get('table_anchor_count', 0)}",
+                        f"table_visual_done={item.get('table_visual_done_count', 0)}",
+                        f"pending={item.get('table_visual_pending_count', 0)}",
+                        f"failed={item.get('table_visual_failed_count', 0)}",
+                        f"selected={item.get('table_visual_selected_count', 0)}",
+                        f"skipped={item.get('table_visual_skipped_count', 0)}",
+                    ]
+                )
+            )
+
+            chunk_diagnostics = item.get("chunk_diagnostics") or []
+            if chunk_diagnostics:
+                only_table_parents = st.checkbox(
+                    "Show only table_parent chunks",
+                    value=False,
+                    key=f"table_parent_only_{idx}",
+                )
+                only_selected_for_visual = st.checkbox(
+                    "Show only Gemini-selected tables",
+                    value=False,
+                    key=f"table_visual_selected_only_{idx}",
+                )
+                visible_rows = chunk_diagnostics
+                if only_table_parents:
+                    visible_rows = [
+                        row for row in visible_rows if row.get("chunk_kind") == "table_parent"
+                    ]
+                if only_selected_for_visual:
+                    visible_rows = [
+                        row for row in visible_rows if bool(row.get("table_visual_selected", False))
+                    ]
+                st.dataframe(visible_rows, use_container_width=True, hide_index=True)
+
+            st.code(item["markdown"], language="markdown")
 
 # Main Chat Interface
 st.subheader("Chat with your Data")
@@ -198,7 +342,8 @@ for message in st.session_state.messages:
             for source in message["sources"]:
                 with st.expander(
                     f"{source['id']} • {source['filename']} "
-                    f"(chunk {source['chunk_index']}, page: {source.get('page_label') or 'n/a'}, "
+                    f"(chunk {source['chunk_index']}, kind: {source.get('chunk_kind') or source.get('content_type') or 'n/a'}, "
+                    f"page: {source.get('page_label') or 'n/a'}, "
                     f"section: {source.get('section_title') or 'n/a'}, score: {source['score']})"
                 ):
                     st.markdown(source['text'])
@@ -223,7 +368,11 @@ if prompt := st.chat_input("What would you like to know?"):
                     if msg.get("role") in {"user", "assistant"} and msg.get("content")
                 ]
                 payload = {"messages": chat_messages}
-                response = requests.post(f"{API_URL}/chat", json=payload, timeout=REQUEST_TIMEOUT)
+                response = requests.post(
+                    f"{API_URL}/chat",
+                    json=payload,
+                    timeout=_request_timeout(REQUEST_TIMEOUT),
+                )
                 
                 if response.status_code == 200:
                     data = response.json()
@@ -241,7 +390,8 @@ if prompt := st.chat_input("What would you like to know?"):
                             for source in sources:
                                 with st.expander(
                                     f"{source['id']} • {source['filename']} "
-                                    f"(chunk {source['chunk_index']}, page: {source.get('page_label') or 'n/a'}, "
+                                    f"(chunk {source['chunk_index']}, kind: {source.get('chunk_kind') or source.get('content_type') or 'n/a'}, "
+                                    f"page: {source.get('page_label') or 'n/a'}, "
                                     f"section: {source.get('section_title') or 'n/a'}, score: {source['score']})",
                                     expanded=False
                                 ):

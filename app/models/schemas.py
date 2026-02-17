@@ -1,6 +1,6 @@
-from typing import List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, Field, field_validator
 
 
 class ChatMessage(BaseModel):
@@ -14,6 +14,7 @@ class ChatMessage(BaseModel):
         if not content:
             raise ValueError("message content must not be empty")
         return content
+
 
 class ChatRequest(BaseModel):
     messages: str | List[ChatMessage]
@@ -29,8 +30,10 @@ class ChatRequest(BaseModel):
             raise ValueError("messages list must not be empty")
         return value
 
+
 class SourceInfo(BaseModel):
-    """Structured source information for interactive viewing"""
+    """Structured source information for interactive viewing."""
+
     id: str
     filename: str
     doc_id: str
@@ -41,11 +44,19 @@ class SourceInfo(BaseModel):
     score: Optional[float]
     text: str  # The actual markdown chunk content
     node_id: str  # Qdrant node ID
-    
+    content_type: Optional[str] = None  # "text", "table", "figure"
+    chunk_kind: Optional[str] = None  # "table_parent", "table_anchor", etc.
+    parent_id: Optional[str] = None
+    table_id: Optional[str] = None
+    schema_version: Optional[int] = None
+    table_visual_status: Optional[str] = None
+
+
 class ChatResponse(BaseModel):
     response: str
-    sources: List[SourceInfo]  # Changed from List[str] to structured objects
-    
+    sources: List[SourceInfo]
+
+
 class IngestionResponse(BaseModel):
     filename: str
     status: str
@@ -53,6 +64,16 @@ class IngestionResponse(BaseModel):
     global_summary: str = ""
     doc_id: Optional[str] = None
     replaced_points: int = 0
+    ingested_markdown: Optional[str] = None
+    chunking_schema_version: int = 2
+    table_parent_count: int = 0
+    table_anchor_count: int = 0
+    table_visual_pending_count: int = 0
+    table_visual_done_count: int = 0
+    table_visual_failed_count: int = 0
+    table_visual_selected_count: int = 0
+    table_visual_skipped_count: int = 0
+    chunk_diagnostics: List[Dict[str, Any]] = Field(default_factory=list)
     error: Optional[str] = None
 
 
@@ -68,6 +89,10 @@ class DocumentSummary(BaseModel):
     filename: str
     chunks: int
     max_chunk_index: Optional[int] = None
+    table_parent_chunks: int = 0
+    table_anchor_chunks: int = 0
+    chunk_kind_counts: Dict[str, int] = Field(default_factory=dict)
+    schema_versions: List[int] = Field(default_factory=list)
 
 
 class DocumentListResponse(BaseModel):

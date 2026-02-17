@@ -32,7 +32,12 @@ def normalize_markdown_text(text: str, preserve_page_markers: bool = False) -> s
     normalized = "\n".join(cleaned_lines)
 
     # Normalize horizontal whitespace and blank line runs.
-    normalized = re.sub(r"[ \t]{2,}", " ", normalized)
+    # Preserve table alignment: don't collapse spaces within pipe-delimited lines.
+    norm_lines = normalized.split("\n")
+    for i, line in enumerate(norm_lines):
+        if not line.strip().startswith("|"):
+            norm_lines[i] = re.sub(r"[ \t]{2,}", " ", line)
+    normalized = "\n".join(norm_lines)
     normalized = re.sub(r"\n{3,}", "\n\n", normalized)
     normalized = "\n".join(line.rstrip() for line in normalized.split("\n"))
     return normalized.strip()
@@ -176,6 +181,7 @@ def build_context_and_sources(
     nodes: Sequence[NodeWithScore],
     max_chunk_chars: int,
     max_sources: int,
+    keep_full_table_parents: bool = False,
 ) -> Tuple[str, List[Dict[str, Any]]]:
     """Build source-labeled context blocks and response source payload."""
     context_blocks: List[str] = []
@@ -185,12 +191,17 @@ def build_context_and_sources(
         source_id = f"S{idx}"
         metadata = node_with_score.node.metadata or {}
         full_text = (node_with_score.node.get_content() or "").strip()
-        snippet = _trim_text(full_text, max_chunk_chars)
 
+        content_type = metadata.get("content_type", "text")
+        chunk_kind = metadata.get("chunk_kind") or content_type
+        if keep_full_table_parents and chunk_kind == "table_parent":
+            snippet = full_text
+        else:
+            snippet = _trim_text(full_text, max_chunk_chars)
         source = {
             "id": source_id,
             "filename": metadata.get("filename", "unknown"),
-            "doc_id": metadata.get("doc_id", "unknown"),
+            "doc_id": metadata.get("source_doc_id", "unknown"),
             "chunk_id": metadata.get("chunk_id", node_with_score.node.node_id),
             "chunk_index": metadata.get("chunk_index", "?"),
             "page_label": metadata.get("page_label"),
@@ -200,6 +211,12 @@ def build_context_and_sources(
             else None,
             "text": snippet,
             "node_id": node_with_score.node.node_id,
+            "content_type": content_type,
+            "chunk_kind": chunk_kind,
+            "parent_id": metadata.get("parent_id"),
+            "table_id": metadata.get("table_id"),
+            "schema_version": metadata.get("schema_version"),
+            "table_visual_status": metadata.get("table_visual_status"),
         }
         sources.append(source)
 
@@ -208,6 +225,10 @@ def build_context_and_sources(
                 [
                     f"[{source_id}]",
                     f"filename: {source['filename']}",
+                    f"content_type: {content_type}",
+                    f"chunk_kind: {source['chunk_kind'] or 'unknown'}",
+                    f"table_id: {source['table_id'] or 'n/a'}",
+                    f"parent_id: {source['parent_id'] or 'n/a'}",
                     f"doc_id: {source['doc_id']}",
                     f"chunk_id: {source['chunk_id']}",
                     f"chunk_index: {source['chunk_index']}",
@@ -248,7 +269,7 @@ def _dedupe_nodes(nodes: Sequence[NodeWithScore], max_items: int) -> List[NodeWi
 
 def _doc_key(candidate: NodeWithScore) -> str:
     metadata = candidate.node.metadata or {}
-    doc_id = metadata.get("doc_id")
+    doc_id = metadata.get("source_doc_id")
     if doc_id:
         return str(doc_id)
     return f"__node__:{candidate.node.node_id}"
@@ -273,6 +294,9 @@ def _drop_probable_boilerplate(
     def should_drop(line: str) -> bool:
         stripped = line.strip()
         if not stripped:
+            return False
+        # Never drop markdown table rows.
+        if stripped.startswith("|"):
             return False
         lowered = stripped.casefold()
 

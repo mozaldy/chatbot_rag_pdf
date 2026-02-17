@@ -1,14 +1,16 @@
 import asyncio
+import json
 import logging
 import re
 import time
 from typing import Any, Dict, Sequence
 
 from llama_index.core import VectorStoreIndex
-from llama_index.core.schema import NodeWithScore
+from llama_index.core.schema import NodeWithScore, TextNode
 from llama_index.core.vector_stores.types import VectorStoreQueryResult
 from llama_index.vector_stores.qdrant import QdrantVectorStore
 from qdrant_client import AsyncQdrantClient
+from qdrant_client.models import FieldCondition, Filter, MatchValue
 
 from app.core.config import settings
 from app.core.llm_setup import get_embedding_model, get_fast_llm, get_llm, get_sparse_embedding_functions
@@ -226,7 +228,16 @@ class RetrievalService:
                     settings.RERANK_MIN_SCORE,
                 )
             timings["rerank_ms"] = self._elapsed_ms(stage_start)
+
+            stage_start = time.perf_counter()
+            if settings.TABLE_PARENT_EXPANSION_ENABLED:
+                reranked = await self._expand_table_parent_candidates(
+                    qdrant_client=qdrant_client,
+                    candidates=reranked,
+                )
+            timings["parent_expand_ms"] = self._elapsed_ms(stage_start)
             timings["reranked_candidates"] = len(reranked)
+            timings["parent_expanded_candidates"] = len(reranked)
 
             if settings.RETRIEVAL_DEBUG_LOGS:
                 logger.info(
@@ -252,6 +263,7 @@ class RetrievalService:
                 nodes=context_nodes,
                 max_chunk_chars=settings.MAX_CONTEXT_CHARS_PER_CHUNK,
                 max_sources=settings.MAX_SOURCES,
+                keep_full_table_parents=settings.TABLE_PARENT_ALWAYS_FULL_CONTEXT,
             )
             timings["context_ms"] = self._elapsed_ms(stage_start)
             timings["sources"] = len(sources)
@@ -475,8 +487,10 @@ class RetrievalService:
             compact.append(
                 {
                     "node_id": candidate.node.node_id,
-                    "doc_id": metadata.get("doc_id"),
+                    "doc_id": metadata.get("source_doc_id"),
                     "chunk_id": metadata.get("chunk_id"),
+                    "chunk_kind": metadata.get("chunk_kind") or metadata.get("content_type"),
+                    "table_id": metadata.get("table_id"),
                     "score": round(candidate.score, 6)
                     if candidate.score is not None
                     else None,
@@ -487,13 +501,14 @@ class RetrievalService:
     @staticmethod
     def _log_timings(timings: Dict[str, float]) -> None:
         logger.info(
-            "chat pipeline timings ms: qdrant_check=%s conversation=%s rewrite=%s retrieve=%s merge=%s rerank=%s context=%s generate=%s total=%s mode=%s alpha=%s reranker=%s rewrite_enabled=%s context_diversity=%s require_valid_citations=%s standalone_query=%s",
+            "chat pipeline timings ms: qdrant_check=%s conversation=%s rewrite=%s retrieve=%s merge=%s rerank=%s parent_expand=%s context=%s generate=%s total=%s mode=%s alpha=%s reranker=%s rewrite_enabled=%s context_diversity=%s require_valid_citations=%s standalone_query=%s",
             timings.get("qdrant_check_ms", 0.0),
             timings.get("conversation_ms", 0.0),
             timings.get("rewrite_ms", 0.0),
             timings.get("retrieve_ms", 0.0),
             timings.get("merge_ms", 0.0),
             timings.get("rerank_ms", 0.0),
+            timings.get("parent_expand_ms", 0.0),
             timings.get("context_ms", 0.0),
             timings.get("generate_ms", 0.0),
             timings.get("total_ms", 0.0),
@@ -506,17 +521,179 @@ class RetrievalService:
             settings.CONVERSATION_STANDALONE_QUERY_ENABLED,
         )
         logger.info(
-            "chat pipeline counters: conversation_messages=%s context_chars=%s retrieval_queries=%s initial_candidates=%s reranked_candidates=%s context_candidates=%s sources=%s citation_retry=%s citation_valid=%s",
+            "chat pipeline counters: conversation_messages=%s context_chars=%s retrieval_queries=%s initial_candidates=%s reranked_candidates=%s parent_expanded_candidates=%s context_candidates=%s sources=%s citation_retry=%s citation_valid=%s",
             int(timings.get("conversation_messages", 0)),
             int(timings.get("conversation_context_chars", 0)),
             int(timings.get("retrieval_queries", 0)),
             int(timings.get("initial_candidates", 0)),
             int(timings.get("reranked_candidates", 0)),
+            int(timings.get("parent_expanded_candidates", 0)),
             int(timings.get("context_candidates", 0)),
             int(timings.get("sources", 0)),
             int(timings.get("citation_retry", 0)),
             int(timings.get("citation_valid", 0)),
         )
+
+    async def _expand_table_parent_candidates(
+        self,
+        qdrant_client: AsyncQdrantClient,
+        candidates: Sequence[NodeWithScore],
+    ) -> list[NodeWithScore]:
+        if not candidates:
+            return []
+
+        base_candidates: list[NodeWithScore] = []
+        table_parent_keys: set[tuple[str, str]] = set()
+        anchor_by_parent: dict[tuple[str, str], NodeWithScore] = {}
+        seen_node_ids: set[str] = set()
+
+        for candidate in candidates:
+            metadata = candidate.node.metadata or {}
+            chunk_kind = str(metadata.get("chunk_kind") or metadata.get("content_type") or "")
+            doc_id = str(metadata.get("source_doc_id") or "")
+            table_id = str(metadata.get("table_id") or metadata.get("parent_id") or "")
+
+            if chunk_kind == "table_parent" and doc_id and table_id:
+                table_parent_keys.add((doc_id, table_id))
+
+            if chunk_kind == "table_anchor" and doc_id:
+                parent_id = str(metadata.get("parent_id") or table_id)
+                if parent_id:
+                    key = (doc_id, parent_id)
+                    existing = anchor_by_parent.get(key)
+                    if existing is None or (candidate.score or 0.0) > (existing.score or 0.0):
+                        anchor_by_parent[key] = candidate
+                    continue
+
+            node_id = candidate.node.node_id
+            if node_id in seen_node_ids:
+                continue
+            seen_node_ids.add(node_id)
+            base_candidates.append(candidate)
+
+        missing_parent_keys = [
+            key for key in anchor_by_parent.keys() if key not in table_parent_keys
+        ]
+
+        if missing_parent_keys:
+            fetch_tasks = []
+            for doc_id, table_id in missing_parent_keys:
+                anchor_candidate = anchor_by_parent[(doc_id, table_id)]
+                seed_score = (anchor_candidate.score or 0.0) + 1e-6
+                fetch_tasks.append(
+                    self._fetch_table_parent_candidate(
+                        qdrant_client=qdrant_client,
+                        doc_id=doc_id,
+                        table_id=table_id,
+                        seed_score=seed_score,
+                    )
+                )
+            fetch_results = await asyncio.gather(*fetch_tasks, return_exceptions=True)
+
+            for key, result in zip(missing_parent_keys, fetch_results):
+                if isinstance(result, Exception):
+                    logger.warning(
+                        "Failed to expand table parent for %s/%s: %s",
+                        key[0],
+                        key[1],
+                        result,
+                    )
+                    continue
+                if result is None:
+                    continue
+                node_id = result.node.node_id
+                if node_id in seen_node_ids:
+                    continue
+                seen_node_ids.add(node_id)
+                base_candidates.append(result)
+                table_parent_keys.add(key)
+
+        for key, anchor_candidate in anchor_by_parent.items():
+            if key in table_parent_keys:
+                continue
+            node_id = anchor_candidate.node.node_id
+            if node_id in seen_node_ids:
+                continue
+            seen_node_ids.add(node_id)
+            base_candidates.append(anchor_candidate)
+
+        def _sort_key(item: NodeWithScore) -> float:
+            if item.score is None:
+                return float("-inf")
+            return float(item.score)
+
+        base_candidates.sort(key=_sort_key, reverse=True)
+        return base_candidates
+
+    async def _fetch_table_parent_candidate(
+        self,
+        qdrant_client: AsyncQdrantClient,
+        doc_id: str,
+        table_id: str,
+        seed_score: float,
+    ) -> NodeWithScore | None:
+        scroll_filter = Filter(
+            must=[
+                FieldCondition(key="source_doc_id", match=MatchValue(value=doc_id)),
+                FieldCondition(key="chunk_kind", match=MatchValue(value="table_parent")),
+                FieldCondition(key="table_id", match=MatchValue(value=table_id)),
+            ]
+        )
+        records, _offset = await qdrant_client.scroll(
+            collection_name=settings.COLLECTION_NAME,
+            scroll_filter=scroll_filter,
+            limit=1,
+            with_payload=True,
+            with_vectors=False,
+        )
+        if not records:
+            return None
+        node = self._record_to_text_node(records[0])
+        if node is None:
+            return None
+        return NodeWithScore(node=node, score=seed_score)
+
+    @staticmethod
+    def _record_to_text_node(record: Any) -> TextNode | None:
+        payload = getattr(record, "payload", None) or {}
+        metadata = {
+            key: value
+            for key, value in payload.items()
+            if key not in {"_node_content", "_node_type"}
+        }
+
+        node_id = str(getattr(record, "id", metadata.get("chunk_id") or "unknown"))
+        text = ""
+        node_content = payload.get("_node_content")
+
+        if isinstance(node_content, str):
+            try:
+                parsed = json.loads(node_content)
+            except Exception:
+                parsed = None
+            if isinstance(parsed, dict):
+                parsed_text = parsed.get("text")
+                if isinstance(parsed_text, str) and parsed_text.strip():
+                    text = parsed_text.strip()
+                parsed_id = parsed.get("id_")
+                if parsed_id:
+                    node_id = str(parsed_id)
+                parsed_meta = parsed.get("metadata")
+                if isinstance(parsed_meta, dict):
+                    for key, value in parsed_meta.items():
+                        metadata.setdefault(key, value)
+
+        if not text:
+            for key in ("text", "document", "content"):
+                value = payload.get(key)
+                if isinstance(value, str) and value.strip():
+                    text = value.strip()
+                    break
+
+        if not text:
+            return None
+
+        return TextNode(id_=node_id, text=text, metadata=metadata)
 
     @staticmethod
     def _merge_retrieval_candidates(
